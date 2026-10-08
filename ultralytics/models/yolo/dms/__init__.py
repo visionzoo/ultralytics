@@ -1,7 +1,7 @@
 from .model import DMSModel
 from .loss import DMSROILoss
 from .schema import LANDMARK_NAMES, PART_SLOTS
-from .teacher import CropTeacher, distillation_loss
+from .teacher import CropTeacher, distillation_loss, make_teacher_crops
 from .export import export_dms_onnx
 
 __all__ = (
@@ -9,6 +9,7 @@ __all__ = (
     "DMSROILoss",
     "CropTeacher",
     "distillation_loss",
+    "make_teacher_crops",
     "export_dms_onnx",
     "LANDMARK_NAMES",
     "PART_SLOTS",

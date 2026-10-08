@@ -17,6 +17,9 @@ from ultralytics.utils import RANK
 
 from .model import DMSModel
 from .dataset import DMSROIDataset, collate_roi
+from .loss import DMSROILoss
+from .schema import LANDMARK_NAMES
+from .teacher import CropTeacher, distillation_loss, make_teacher_crops
 
 
 class DMSTrainer(DetectionTrainer):
@@ -36,10 +39,13 @@ def _cycle(loader: DataLoader) -> Iterator[dict]:
         yield from loader
 
 
-def _roi_loaders(manifest_dir: Path, image_size: int, batch_size: int, split: str) -> dict[str, Iterator[dict]]:
+def _roi_loaders(
+    manifest_dir: Path, image_size: int, batch_size: int, split: str, tasks: tuple[str, ...] | None = None
+) -> dict[str, Iterator[dict]]:
     sources = {"parts": "dsm.jsonl", "landmark": "eye12.jsonl", "pose": "pose.jsonl"}
     loaders = {}
-    for task, filename in sources.items():
+    for task in tasks or tuple(sources):
+        filename = sources[task]
         path = manifest_dir / filename
         if path.is_file() and path.stat().st_size:
             dataset = DMSROIDataset(path, task, image_size, split)
@@ -66,6 +72,97 @@ def load_dms_weights(model: DMSModel, weights: str | Path | None) -> DMSModel:
     return model
 
 
+def load_teacher_weights(teacher: CropTeacher, weights: str | Path) -> CropTeacher:
+    """Load a self-contained crop-teacher checkpoint and freeze it for KD*."""
+    checkpoint, _ = torch_safe_load(weights)
+    stored = checkpoint.get("model") if isinstance(checkpoint, dict) else checkpoint
+    if not isinstance(stored, dict):
+        raise TypeError(f"teacher checkpoint has no state_dict: {weights}")
+    teacher.load_state_dict(stored)
+    return teacher.freeze()
+
+
+def _teacher_valid(batch: dict) -> torch.Tensor:
+    """KD* only applies where the crop teacher has landmark or pose supervision."""
+    if "landmark_valid" in batch:
+        return batch["landmark_valid"].bool().any(dim=1)
+    if "pose_valid" in batch:
+        return batch["pose_valid"].bool()
+    return torch.zeros(batch["img"].shape[0], device=batch["img"].device, dtype=torch.bool)
+
+
+def train_teacher(
+    manifest_dir: str | Path,
+    output: str | Path,
+    epochs: int,
+    batch_size: int,
+    image_size: int,
+    steps_per_epoch: int,
+    crop_size: int = 128,
+    lr: float = 1e-4,
+    device: str = "cpu",
+) -> Path:
+    """Train the RGB crop teacher on only landmark and pose train samples."""
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    device_obj = torch.device(device)
+    teacher = CropTeacher().to(device_obj).train()
+    criterion = DMSROILoss()
+    loaders = _roi_loaders(Path(manifest_dir), image_size, batch_size, "train", ("landmark", "pose"))
+    optimizer = torch.optim.AdamW(teacher.parameters(), lr=lr)
+    history = []
+    tasks = tuple(loaders)
+    for epoch in range(epochs):
+        totals, counts = {}, {}
+        for _ in range(steps_per_epoch):
+            task = random.choice(tasks)
+            batch = _device_batch(next(loaders[task]), device_obj)
+            batch["img"] = batch["img"].float() / 255
+            optimizer.zero_grad(set_to_none=True)
+            outputs = teacher(make_teacher_crops(batch["img"], batch["face_rois"], crop_size))
+            loss, _ = criterion(outputs, batch)
+            loss.backward()
+            optimizer.step()
+            totals[task] = totals.get(task, 0.0) + float(loss.detach())
+            counts[task] = counts.get(task, 0) + 1
+        history.append({task: totals[task] / counts[task] for task in totals})
+        torch.save(
+            {
+                "model": teacher.state_dict(),
+                "epoch": epoch + 1,
+                "history": history,
+                "metadata": {
+                    "crop_size": crop_size,
+                    "landmark_names": LANDMARK_NAMES,
+                    "pose_order": "yaw_pitch_roll_deg",
+                },
+            },
+            output / "teacher.pt",
+        )
+    (output / "teacher_train_metrics.json").write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
+    return output / "teacher.pt"
+
+
+def _student_roi_loss(
+    model: DMSModel,
+    batch: dict,
+    teacher: CropTeacher | None,
+    teacher_crop_size: int,
+    kd_feature_weight: float,
+    kd_heatmap_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    outputs = model.forward_dms(batch["img"], batch["face_rois"], batch.get("roi_valid"))
+    total, items = model.dms_criterion(outputs, batch)
+    valid = _teacher_valid(batch)
+    if teacher is not None and valid.any():
+        with torch.inference_mode():
+            teacher_outputs = teacher(make_teacher_crops(batch["img"], batch["face_rois"], teacher_crop_size))
+        kd = distillation_loss(outputs, teacher_outputs, valid)
+        total = total + kd_feature_weight * kd["kd_feature"] + kd_heatmap_weight * kd["kd_heatmap"]
+        items.update(kd)
+    return total, items
+
+
 def train_roi(
     model: DMSModel,
     manifest_dir: str | Path,
@@ -77,12 +174,18 @@ def train_roi(
     lr: float = 1e-4,
     task_weights: dict[str, float] | None = None,
     device: str = "cpu",
+    teacher: CropTeacher | None = None,
+    teacher_crop_size: int = 128,
+    kd_feature_weight: float = 1.0,
+    kd_heatmap_weight: float = 1.0,
 ) -> Path:
     """Train heterogeneous ROI batches; global detector training stays with DetectionTrainer."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     device_obj = torch.device(device)
     model.to(device_obj).train()
+    if teacher is not None:
+        teacher.to(device_obj).freeze()
     loaders = _roi_loaders(Path(manifest_dir), image_size, batch_size, "train")
     task_weights = task_weights or {task: 1.0 for task in loaders}
     tasks = [task for task in loaders if task_weights.get(task, 0) > 0]
@@ -97,7 +200,9 @@ def train_roi(
             batch = _device_batch(next(loaders[task]), device_obj)
             batch["img"] = batch["img"].float() / 255
             optimizer.zero_grad(set_to_none=True)
-            loss, items = model.loss(batch)
+            loss, items = _student_roi_loss(
+                model, batch, teacher, teacher_crop_size, kd_feature_weight, kd_heatmap_weight
+            )
             loss.backward()
             optimizer.step()
             totals[task] = totals.get(task, 0.0) + float(loss.detach())
@@ -140,7 +245,26 @@ def main() -> None:
     parser.add_argument("--steps-per-epoch", type=int, default=100)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--eval", action="store_true")
+    parser.add_argument("--train-teacher", action="store_true")
+    parser.add_argument("--teacher-weights", type=Path)
+    parser.add_argument("--teacher-crop-size", type=int, default=128)
+    parser.add_argument("--kd-feature-weight", type=float, default=1.0)
+    parser.add_argument("--kd-heatmap-weight", type=float, default=1.0)
     args = parser.parse_args()
+    if args.train_teacher:
+        print(
+            train_teacher(
+                args.manifest_dir,
+                args.output,
+                args.epochs,
+                args.batch,
+                args.imgsz,
+                args.steps_per_epoch,
+                args.teacher_crop_size,
+                device=args.device,
+            )
+        )
+        return
     model = load_dms_weights(DMSModel(args.model_config, nc=3, verbose=True), args.weights)
     if args.eval:
         metrics = evaluate_roi(model, args.manifest_dir, args.batch, args.imgsz, args.steps_per_epoch, args.device)
@@ -148,4 +272,20 @@ def main() -> None:
         (args.output / "roi_eval_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(metrics))
     else:
-        print(train_roi(model, args.manifest_dir, args.output, args.epochs, args.batch, args.imgsz, args.steps_per_epoch, device=args.device))
+        teacher = load_teacher_weights(CropTeacher(), args.teacher_weights) if args.teacher_weights else None
+        print(
+            train_roi(
+                model,
+                args.manifest_dir,
+                args.output,
+                args.epochs,
+                args.batch,
+                args.imgsz,
+                args.steps_per_epoch,
+                device=args.device,
+                teacher=teacher,
+                teacher_crop_size=args.teacher_crop_size,
+                kd_feature_weight=args.kd_feature_weight,
+                kd_heatmap_weight=args.kd_heatmap_weight,
+            )
+        )

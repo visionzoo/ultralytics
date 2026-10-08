@@ -39,6 +39,13 @@ class CropTeacher(nn.Module):
         return self.requires_grad_(False)
 
 
+def make_teacher_crops(image: torch.Tensor, face_rois: torch.Tensor, size: int = 128) -> torch.Tensor:
+    """Crop letterboxed RGB faces with the same aligned ROIAlign convention as the student."""
+    from torchvision.ops import roi_align
+
+    return roi_align(image, face_rois, (size, size), spatial_scale=1.0, aligned=True)
+
+
 def distillation_loss(
     student: Mapping[str, torch.Tensor], teacher: Mapping[str, torch.Tensor], valid: torch.Tensor
 ) -> dict[str, torch.Tensor]:
