@@ -75,6 +75,7 @@ from .conv import (
     RepConv,
     SpatialAttention,
 )
+from .dms import DMSROIHeads
 from .head import (
     OBB,
     OBB26,
@@ -149,6 +150,7 @@ __all__ = (
     "Conv2",
     "ConvTranspose",
     "DWConv",
+    "DMSROIHeads",
     "DWConvTranspose2d",
     "DeformableTransformerDecoder",
     "DeformableTransformerDecoderLayer",
