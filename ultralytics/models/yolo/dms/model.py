@@ -9,6 +9,8 @@ import torch
 from ultralytics.nn.modules.dms import DMSROIHeads, roi_align_features
 from ultralytics.nn.tasks import DetectionModel
 
+from .loss import DMSROILoss
+
 
 @dataclass
 class EncoderOutput:
@@ -25,6 +27,7 @@ class DMSModel(DetectionModel):
     def __init__(self, cfg="yolo26n.yaml", ch=3, nc=None, verbose=True):
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
         self.dms_heads = DMSROIHeads()
+        self.dms_criterion = DMSROILoss()
 
     @staticmethod
     def _stride_for(image: torch.Tensor, feature: torch.Tensor) -> int | None:
@@ -71,3 +74,20 @@ class DMSModel(DetectionModel):
             )
             result.update(self.forward_roi(b2_rois, p3_rois, roi_valid))
         return result
+
+    def loss(self, batch: dict, preds=None):
+        """Route global batches to native YOLO loss and ROI batches to DMS loss."""
+        task = batch.get("task", "global")
+        if isinstance(task, (list, tuple)):
+            if len(set(task)) != 1:
+                raise ValueError("a DMS batch must contain exactly one task")
+            task = task[0]
+        if task == "global":
+            return super().loss(batch, preds)
+        required = {"img", "face_rois"}
+        missing = required.difference(batch)
+        if missing:
+            raise KeyError(f"ROI batch is missing: {sorted(missing)}")
+        outputs = self.forward_dms(batch["img"], batch["face_rois"], batch.get("roi_valid"))
+        total, items = self.dms_criterion(outputs, batch)
+        return total, {name: value.detach() for name, value in items.items()}

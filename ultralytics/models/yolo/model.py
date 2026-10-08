@@ -26,6 +26,7 @@ from ultralytics.nn.tasks import (
     YOLOEModel,
     YOLOESegModel,
 )
+from ultralytics.models.yolo.dms import DMSModel
 from ultralytics.utils import ROOT, YAML
 
 
@@ -109,6 +110,12 @@ class YOLO(Model):
             "detect": {
                 "model": DetectionModel,
                 "trainer": yolo.detect.DetectionTrainer,
+                "validator": yolo.detect.DetectionValidator,
+                "predictor": yolo.detect.DetectionPredictor,
+            },
+            "dms": {
+                "model": DMSModel,
+                "trainer": yolo.dms.DMSTrainer,
                 "validator": yolo.detect.DetectionValidator,
                 "predictor": yolo.detect.DetectionPredictor,
             },
