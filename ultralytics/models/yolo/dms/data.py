@@ -28,6 +28,7 @@ class Eye12Record:
     image: Path
     points: tuple[tuple[float, float], ...]
     crop_box: Box
+    input_size: int
     split: str
 
 
@@ -121,7 +122,9 @@ def iter_eye12(jsonl_path: str | Path) -> Iterator[Eye12Record]:
             if len(points) != 12:
                 raise ValueError(f"expected 12 points at {jsonl_path}:{line_number}")
             crop = item["crop_box_xyxy"]
-            yield Eye12Record(Path(item["image"]), points, Box(*(float(v) for v in crop)), item.get("split", ""))
+            yield Eye12Record(
+                Path(item["image"]), points, Box(*(float(v) for v in crop)), int(item.get("input_size", 128)), item.get("split", "")
+            )
 
 
 def _rodrigues_to_matrix(rvec: np.ndarray) -> np.ndarray:

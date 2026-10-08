@@ -36,7 +36,7 @@ def build_manifests(dsm_root: Path, eye12_root: Path, wlp_root: Path, output: Pa
                     "task": "landmark",
                     "image": str(record.image),
                     "points": record.points,
-                    "face_box_xyxy": list(vars(record.crop_box).values()),
+                    "face_box_xyxy": [0, 0, record.input_size, record.input_size],
                     "split": record.split,
                 }
                 for source in _eye12_sources(eye12_root)
