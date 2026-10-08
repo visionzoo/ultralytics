@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
@@ -127,26 +126,14 @@ def iter_eye12(jsonl_path: str | Path) -> Iterator[Eye12Record]:
             )
 
 
-def _rodrigues_to_matrix(rvec: np.ndarray) -> np.ndarray:
-    theta = float(np.linalg.norm(rvec))
-    if theta < 1e-8:
-        return np.eye(3, dtype=np.float64)
-    axis = rvec / theta
-    cross = np.array(((0.0, -axis[2], axis[1]), (axis[2], 0.0, -axis[0]), (-axis[1], axis[0], 0.0)))
-    return np.eye(3) + math.sin(theta) * cross + (1 - math.cos(theta)) * (cross @ cross)
-
-
-def rodrigues_to_ypr(rvec: np.ndarray) -> tuple[float, float, float]:
-    """Return degrees using R = Rz(roll) @ Ry(yaw) @ Rx(pitch)."""
-    rotation = _rodrigues_to_matrix(np.asarray(rvec, dtype=np.float64).reshape(3))
-    yaw = math.asin(float(np.clip(-rotation[2, 0], -1.0, 1.0)))
-    pitch = math.atan2(float(rotation[2, 1]), float(rotation[2, 2]))
-    roll = math.atan2(float(rotation[1, 0]), float(rotation[0, 0]))
-    return tuple(math.degrees(value) for value in (yaw, pitch, roll))
-
-
 def parse_300wlp_mat(path: str | Path) -> PoseRecord:
-    """Read a 300W-LP pair. SciPy is imported lazily for non-pose workflows."""
+    """Read a 300W-LP pair and normalize its native pitch/yaw/roll order.
+
+    The dataset's bundled ``main_show_with_model.m`` defines ``Pose_Para`` as
+    ``[pitch, yaw, roll, ...]`` in radians.  The DMS pose head uses degrees in
+    ``[yaw, pitch, roll]`` order, so this is a reordering/unit conversion, not
+    a Rodrigues-vector conversion.
+    """
     try:
         from scipy.io import loadmat
     except ImportError as exc:  # pragma: no cover - depends on optional environment
@@ -157,7 +144,8 @@ def parse_300wlp_mat(path: str | Path) -> PoseRecord:
     pose = np.asarray(data["Pose_Para"], dtype=np.float64).reshape(-1)
     if roi.size < 4 or pose.size < 3:
         raise ValueError(f"invalid 300W-LP annotation: {mat_path}")
-    return PoseRecord(mat_path.with_suffix(".jpg"), Box(*map(float, roi[:4])), rodrigues_to_ypr(pose[:3]))
+    pitch, yaw, roll = np.degrees(pose[:3])
+    return PoseRecord(mat_path.with_suffix(".jpg"), Box(*map(float, roi[:4])), (float(yaw), float(pitch), float(roll)))
 
 
 def write_association_audit(path: str | Path, records: Iterator[tuple[VOCRecord, tuple[PartAssociation, ...]]]) -> None:
