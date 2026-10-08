@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import random
+import shutil
 from pathlib import Path
 
-from .data import dsm_manifest_entry, iter_dsm, iter_eye12, parse_300wlp_mat
+import yaml
+
+from .data import dsm_image_path, dsm_manifest_entry, iter_dsm, iter_eye12, parse_300wlp_mat
+from .schema import is_face_label, normalized_label
+
+
+GLOBAL_NAMES = ("face", "phone", "cigarette")
 
 
 def _write_jsonl(path: Path, rows) -> int:
@@ -25,7 +35,76 @@ def _eye12_sources(root: Path) -> list[Path]:
     return mixed or sorted(annotations.glob("*.jsonl"))
 
 
-def build_manifests(dsm_root: Path, eye12_root: Path, wlp_root: Path, output: Path) -> dict[str, int]:
+def _global_class(label: str) -> int | None:
+    label = normalized_label(label)
+    if is_face_label(label):
+        return 0
+    if label in {"phone", "playphone"}:
+        return 1
+    if label in {"cigar", "cigarette"}:
+        return 2
+    return None
+
+
+def _link(source: Path, target: Path, mode: str) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() or target.is_symlink():
+        return
+    if mode == "symlink":
+        target.symlink_to(source.resolve())
+    elif mode == "hardlink":
+        os.link(source, target)
+    elif mode == "copy":
+        shutil.copy2(source, target)
+    else:
+        raise ValueError(f"unknown link mode: {mode}")
+
+
+def materialize_global_yolo(dsm_root: Path, output: Path, seed: int = 20260916, link_mode: str = "hardlink") -> Path:
+    """Build a deterministic native-YOLO dataset from whole-frame DSM VOC XML."""
+    records = list(iter_dsm(dsm_root))
+    if not records:
+        raise ValueError(f"no DSM VOC annotations under {dsm_root}")
+    rng = random.Random(seed)
+    order = records[:]
+    rng.shuffle(order)
+    train_end = max(1, int(len(order) * 0.70))
+    val_end = min(len(order), train_end + int(len(order) * 0.15))
+    split_of = {record.annotation: "train" if index < train_end else "val" if index < val_end else "test" for index, record in enumerate(order)}
+    rows = []
+    for record in records:
+        split, image = split_of[record.annotation], dsm_image_path(record)
+        stem = hashlib.sha256(str(record.annotation).encode()).hexdigest()[:16]
+        image_name = stem + image.suffix.lower()
+        destination = output / "images" / split / image_name
+        _link(image, destination, link_mode)
+        labels = []
+        for obj in record.objects:
+            class_id = _global_class(obj.label)
+            if class_id is None:
+                continue
+            box = obj.box
+            x_center, y_center = (box.x1 + box.x2) / 2 / record.width, (box.y1 + box.y2) / 2 / record.height
+            width, height = box.width / record.width, box.height / record.height
+            labels.append(f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}")
+        (output / "labels" / split).mkdir(parents=True, exist_ok=True)
+        (output / "labels" / split / f"{stem}.txt").write_text("\n".join(labels) + ("\n" if labels else ""), encoding="utf-8")
+        rows.append({"annotation": str(record.annotation), "image": str(image), "split": split, "global_labels": len(labels)})
+    data = {"path": str(output), "train": "images/train", "val": "images/val", "test": "images/test", "names": dict(enumerate(GLOBAL_NAMES))}
+    (output / "data.yaml").write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    (output / "split_manifest.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return output / "data.yaml"
+
+
+def build_manifests(
+    dsm_root: Path,
+    eye12_root: Path,
+    wlp_root: Path,
+    output: Path,
+    global_yolo_output: Path | None = None,
+    split_seed: int = 20260916,
+    link_mode: str = "hardlink",
+) -> dict[str, int | str]:
     """Materialize source records without copying images or silently dropping ambiguity."""
     counts = {
         "dsm": _write_jsonl(output / "dsm.jsonl", (dsm_manifest_entry(record) for record in iter_dsm(dsm_root))),
@@ -59,6 +138,9 @@ def build_manifests(dsm_root: Path, eye12_root: Path, wlp_root: Path, output: Pa
         ),
     }
     (output / "summary.json").write_text(json.dumps(counts, indent=2) + "\n", encoding="utf-8")
+    if global_yolo_output:
+        counts["global_yolo"] = str(materialize_global_yolo(dsm_root, global_yolo_output, split_seed, link_mode))
+        (output / "summary.json").write_text(json.dumps(counts, indent=2) + "\n", encoding="utf-8")
     return counts
 
 
@@ -68,9 +150,24 @@ def main() -> None:
     parser.add_argument("--eye12-root", type=Path, required=True)
     parser.add_argument("--300wlp-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--global-yolo-output", type=Path)
+    parser.add_argument("--split-seed", type=int, default=20260916)
+    parser.add_argument("--link-mode", choices=("symlink", "hardlink", "copy"), default="hardlink")
     args = parser.parse_args()
     wlp_root = getattr(args, "300wlp_root")
-    print(json.dumps(build_manifests(args.dsm_root, args.eye12_root, wlp_root, args.output)))
+    print(
+        json.dumps(
+            build_manifests(
+                args.dsm_root,
+                args.eye12_root,
+                wlp_root,
+                args.output,
+                args.global_yolo_output,
+                args.split_seed,
+                args.link_mode,
+            )
+        )
+    )
 
 
 if __name__ == "__main__":
