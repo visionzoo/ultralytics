@@ -36,13 +36,13 @@ def _cycle(loader: DataLoader) -> Iterator[dict]:
         yield from loader
 
 
-def _roi_loaders(manifest_dir: Path, image_size: int, batch_size: int) -> dict[str, Iterator[dict]]:
+def _roi_loaders(manifest_dir: Path, image_size: int, batch_size: int, split: str) -> dict[str, Iterator[dict]]:
     sources = {"parts": "dsm.jsonl", "landmark": "eye12.jsonl", "pose": "pose.jsonl"}
     loaders = {}
     for task, filename in sources.items():
         path = manifest_dir / filename
         if path.is_file() and path.stat().st_size:
-            dataset = DMSROIDataset(path, task, image_size)
+            dataset = DMSROIDataset(path, task, image_size, split)
             loaders[task] = _cycle(DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_roi))
     if not loaders:
         raise ValueError(f"no usable ROI manifests in {manifest_dir}")
@@ -83,7 +83,7 @@ def train_roi(
     output.mkdir(parents=True, exist_ok=True)
     device_obj = torch.device(device)
     model.to(device_obj).train()
-    loaders = _roi_loaders(Path(manifest_dir), image_size, batch_size)
+    loaders = _roi_loaders(Path(manifest_dir), image_size, batch_size, "train")
     task_weights = task_weights or {task: 1.0 for task in loaders}
     tasks = [task for task in loaders if task_weights.get(task, 0) > 0]
     if not tasks:
@@ -117,7 +117,7 @@ def evaluate_roi(
     device_obj = torch.device(device)
     model.to(device_obj).eval()
     results = {}
-    for task, loader in _roi_loaders(Path(manifest_dir), image_size, batch_size).items():
+    for task, loader in _roi_loaders(Path(manifest_dir), image_size, batch_size, "test").items():
         losses = []
         for _ in range(batches_per_task):
             batch = _device_batch(next(loader), device_obj)

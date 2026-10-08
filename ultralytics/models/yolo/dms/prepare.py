@@ -17,6 +17,7 @@ from .schema import is_face_label, normalized_label
 
 
 GLOBAL_NAMES = ("face", "phone", "cigarette")
+SPLIT_NAMES = ("train", "val", "test")
 
 
 def _write_jsonl(path: Path, rows) -> int:
@@ -46,6 +47,20 @@ def _global_class(label: str) -> int | None:
     return None
 
 
+def _split_paths(paths: list[Path], seed: int) -> dict[Path, str]:
+    """Assign deterministic 70/15/15 splits without relying on source ordering."""
+    if not paths:
+        return {}
+    order = list(paths)
+    random.Random(seed).shuffle(order)
+    train_end = max(1, int(len(order) * 0.70))
+    val_end = min(len(order), train_end + int(len(order) * 0.15))
+    return {
+        path: "train" if index < train_end else "val" if index < val_end else "test"
+        for index, path in enumerate(order)
+    }
+
+
 def _link(source: Path, target: Path, mode: str) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() or target.is_symlink():
@@ -60,17 +75,19 @@ def _link(source: Path, target: Path, mode: str) -> None:
         raise ValueError(f"unknown link mode: {mode}")
 
 
-def materialize_global_yolo(dsm_root: Path, output: Path, seed: int = 20260916, link_mode: str = "hardlink") -> Path:
+def materialize_global_yolo(
+    dsm_root: Path,
+    output: Path,
+    seed: int = 20260916,
+    link_mode: str = "hardlink",
+    records=None,
+    splits: dict[Path, str] | None = None,
+) -> Path:
     """Build a deterministic native-YOLO dataset from whole-frame DSM VOC XML."""
-    records = list(iter_dsm(dsm_root))
+    records = list(iter_dsm(dsm_root)) if records is None else records
     if not records:
         raise ValueError(f"no DSM VOC annotations under {dsm_root}")
-    rng = random.Random(seed)
-    order = records[:]
-    rng.shuffle(order)
-    train_end = max(1, int(len(order) * 0.70))
-    val_end = min(len(order), train_end + int(len(order) * 0.15))
-    split_of = {record.annotation: "train" if index < train_end else "val" if index < val_end else "test" for index, record in enumerate(order)}
+    split_of = _split_paths([record.annotation for record in records], seed) if splits is None else splits
     rows = []
     for record in records:
         split, image = split_of[record.annotation], dsm_image_path(record)
@@ -106,8 +123,15 @@ def build_manifests(
     link_mode: str = "hardlink",
 ) -> dict[str, int | str]:
     """Materialize source records without copying images or silently dropping ambiguity."""
+    dsm_records = list(iter_dsm(dsm_root))
+    dsm_splits = _split_paths([record.annotation for record in dsm_records], split_seed)
+    pose_sources = sorted(wlp_root.glob("**/*.mat"))
+    pose_splits = _split_paths(pose_sources, split_seed)
     counts = {
-        "dsm": _write_jsonl(output / "dsm.jsonl", (dsm_manifest_entry(record) for record in iter_dsm(dsm_root))),
+        "dsm": _write_jsonl(
+            output / "dsm.jsonl",
+            ({**dsm_manifest_entry(record), "split": dsm_splits[record.annotation]} for record in dsm_records),
+        ),
         "eye12": _write_jsonl(
             output / "eye12.jsonl",
             (
@@ -130,8 +154,9 @@ def build_manifests(
                     "image": str(record.image),
                     "face_box_xyxy": list(vars(record.face_box).values()),
                     "pose_ypr_deg": record.ypr_deg,
+                    "split": pose_splits[source],
                 }
-                for source in sorted(wlp_root.glob("**/*.mat"))
+                for source in pose_sources
                 for record in (parse_300wlp_mat(source),)
                 if record.image.is_file()
             ),
@@ -139,7 +164,9 @@ def build_manifests(
     }
     (output / "summary.json").write_text(json.dumps(counts, indent=2) + "\n", encoding="utf-8")
     if global_yolo_output:
-        counts["global_yolo"] = str(materialize_global_yolo(dsm_root, global_yolo_output, split_seed, link_mode))
+        counts["global_yolo"] = str(
+            materialize_global_yolo(dsm_root, global_yolo_output, split_seed, link_mode, dsm_records, dsm_splits)
+        )
         (output / "summary.json").write_text(json.dumps(counts, indent=2) + "\n", encoding="utf-8")
     return counts
 

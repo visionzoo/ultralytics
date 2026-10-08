@@ -38,12 +38,15 @@ def _letterbox(image: np.ndarray, boxes: np.ndarray, image_size: int) -> tuple[t
 class DMSROIDataset(Dataset):
     """One manifest task per dataset; each sample carries exactly one face ROI."""
 
-    def __init__(self, manifest: str | Path, task: str, image_size: int = 640):
+    def __init__(self, manifest: str | Path, task: str, image_size: int = 640, split: str | None = None):
         self.task, self.image_size = task, image_size
         rows = [json.loads(line) for line in Path(manifest).read_text(encoding="utf-8").splitlines()]
+        if split:
+            rows = [row for row in rows if row.get("split") == split]
         self.samples = self._expand(rows)
         if not self.samples:
-            raise ValueError(f"no {task} samples in {manifest}")
+            suffix = f" split={split}" if split else ""
+            raise ValueError(f"no {task} samples in {manifest}{suffix}")
 
     def _expand(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if self.task == "landmark":
