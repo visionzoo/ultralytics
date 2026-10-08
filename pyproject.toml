@@ -82,6 +82,9 @@ dependencies = [
 
 # Optional dependencies ------------------------------------------------------------------------------------------------
 [project.optional-dependencies]
+dms = [
+    "scipy>=1.10", # 300W-LP MATLAB annotations
+]
 dev = [
     "ipython",
     "pytest",

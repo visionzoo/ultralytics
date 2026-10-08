@@ -65,6 +65,20 @@ def parse_voc_xml(path: str | Path) -> VOCRecord:
     )
 
 
+def dsm_image_path(record: VOCRecord) -> Path:
+    """Resolve DSM's sibling ``Annotations``/``images`` convention strictly."""
+    image = record.annotation.parent.parent / "images" / record.filename
+    if not image.is_file():
+        raise FileNotFoundError(f"DSM image missing for {record.annotation}: {image}")
+    return image
+
+
+def iter_dsm(root: str | Path) -> Iterator[VOCRecord]:
+    """Yield all DSM annotations in deterministic order."""
+    for annotation in sorted(Path(root).glob("**/Annotations/*.xml")):
+        yield parse_voc_xml(annotation)
+
+
 def associate_dsm_parts(record: VOCRecord, min_coverage: float = 0.8, tie_iou: float = 1e-6) -> tuple[PartAssociation, ...]:
     """Associate local DSM labels to faces, preserving uncertainty for audit.
 
@@ -151,3 +165,15 @@ def write_association_audit(path: str | Path, records: Iterator[tuple[VOCRecord,
         for record, associations in records:
             for association in associations:
                 handle.write(json.dumps({"annotation": str(record.annotation), **association.to_dict()}, ensure_ascii=False) + "\n")
+
+
+def dsm_manifest_entry(record: VOCRecord) -> dict:
+    """Create one loss-agnostic DSM manifest row and preserve all raw labels."""
+    associations = associate_dsm_parts(record)
+    return {
+        "task": "dsm",
+        "image": str(dsm_image_path(record)),
+        "size": [record.width, record.height],
+        "objects": [{"label": obj.label, "box_xyxy": list(vars(obj.box).values())} for obj in record.objects],
+        "part_associations": [item.to_dict() for item in associations],
+    }
