@@ -100,6 +100,8 @@ class YOLO(Model):
     @property
     def task_map(self) -> dict[str, dict[str, Any]]:
         """Map head to model, trainer, validator, and predictor classes."""
+        from ultralytics.models.yolo.dms.train import DMSTrainer
+
         return {
             "classify": {
                 "model": ClassificationModel,
@@ -115,7 +117,7 @@ class YOLO(Model):
             },
             "dms": {
                 "model": DMSModel,
-                "trainer": yolo.dms.DMSTrainer,
+                "trainer": DMSTrainer,
                 "validator": yolo.detect.DetectionValidator,
                 "predictor": yolo.detect.DetectionPredictor,
             },
