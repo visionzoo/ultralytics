@@ -6,9 +6,14 @@ import argparse
 import csv
 import json
 import random
+import sys
 from datetime import datetime
 from collections.abc import Iterator
 from pathlib import Path
+
+_RESEARCH_ROOT = Path(__file__).resolve().parents[6]
+if str(_RESEARCH_ROOT) not in sys.path:
+    sys.path.insert(0, str(_RESEARCH_ROOT))
 
 import torch
 from torch.utils.data import DataLoader
