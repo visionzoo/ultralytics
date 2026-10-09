@@ -242,6 +242,14 @@ def train_roi(
     output.mkdir(parents=True, exist_ok=True)
     device_obj = torch.device(device)
     model.to(device_obj).train()
+    # ROI fine-tuning must not move the global detector/backbone.  The deploy
+    # checkpoint intentionally takes those weights from global best.pt.
+    model.model.eval()
+    for parameter in model.model.parameters():
+        parameter.requires_grad_(False)
+    model.dms_heads.train()
+    for parameter in model.dms_heads.parameters():
+        parameter.requires_grad_(True)
     shape_prior = ShapeBayesPrior.from_json(Path(manifest_dir) / "shape_prior.json")
     if shape_prior is not None:
         model.dms_criterion.shape_prior = shape_prior.to(device_obj)
