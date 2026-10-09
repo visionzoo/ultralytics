@@ -50,9 +50,12 @@ def _cycle(loader: DataLoader) -> Iterator[dict]:
 def _cuda_devices(spec: str) -> tuple[torch.device, list[int]]:
     """Return the primary device and CUDA ids for a compact single-process trainer."""
     value = str(spec).strip()
-    if not value.startswith("cuda"):
+    if value.startswith("cuda"):
+        ids = value.split(":", 1)[1] if ":" in value else "0"
+    elif "," in value or value.isdigit():
+        ids = value
+    else:
         return torch.device(value), []
-    ids = value.split(":", 1)[1] if ":" in value else "0"
     device_ids = [int(item) for item in ids.split(",") if item.strip()]
     if not device_ids:
         device_ids = [0]
