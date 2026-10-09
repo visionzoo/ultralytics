@@ -91,7 +91,7 @@ def export_dms_onnx(
         roi_path,
         opset_version=opset,
         input_names=["b2_rois", "p3_rois", "roi_valid"],
-        output_names=["part_box", "part_presence_logits", "eye_state_logits", "mouth_state_logits", "landmark_heatmap", "pose_ypr"],
+        output_names=["part_box", "part_presence_logits", "eye_state_logits", "mouth_state_logits", "landmark_heatmap", "landmark_logvar", "pose_ypr"],
     )
     manifest = {
         "schema_version": 1,

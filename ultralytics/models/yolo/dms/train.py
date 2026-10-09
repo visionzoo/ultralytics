@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import random
+from datetime import datetime
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from .dataset import DMSROIDataset, collate_roi
 from .loss import DMSROILoss
 from .schema import LANDMARK_NAMES
 from .teacher import CropTeacher, distillation_loss, make_teacher_crops
+from dms.shape_bayes import ShapeBayesPrior
 
 
 class DMSTrainer(DetectionTrainer):
@@ -91,6 +94,48 @@ def _teacher_valid(batch: dict) -> torch.Tensor:
     return torch.zeros(batch["img"].shape[0], device=batch["img"].device, dtype=torch.bool)
 
 
+def _write_teacher_artifacts(output: Path, history: list[dict]) -> None:
+    (output / "teacher_train_metrics.json").write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
+    tasks = sorted({task for row in history for task in row})
+    with (output / "teacher_train_metrics.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["epoch", *tasks])
+        writer.writeheader()
+        for index, row in enumerate(history, 1):
+            writer.writerow({"epoch": index, **row})
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        # Landmark heatmap loss and pose angle loss have different units/scales.
+        # Plot them with independent y-axes; never compare their raw heights.
+        fig, axes = plt.subplots(max(1, len(tasks)), 1, figsize=(9, 4 * max(1, len(tasks))), squeeze=False)
+        axes = [item for row in axes for item in row]
+        for index, task in enumerate(tasks):
+            values = [row.get(task) for row in history]
+            axes[index].plot(range(1, len(values) + 1), values, label=task)
+            axes[index].set_xlabel("Epoch")
+            axes[index].set_ylabel(f"{task} loss")
+            axes[index].set_title(f"DMS Teacher - {task} loss")
+            axes[index].grid(True, alpha=0.3)
+            axes[index].legend()
+        fig.tight_layout()
+        fig.savefig(output / "teacher_loss_curves.png", dpi=150)
+        plt.close(fig)
+        for task in tasks:
+            values = [row.get(task) for row in history]
+            plt.figure(figsize=(9, 4))
+            plt.plot(range(1, len(values) + 1), values, label=task)
+            plt.xlabel("Epoch")
+            plt.ylabel(f"{task} loss")
+            plt.title(f"DMS Teacher - {task} loss")
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(output / f"teacher_loss_{task}.png", dpi=150)
+            plt.close()
+    except Exception as exc:
+        (output / "teacher_plot_error.txt").write_text(str(exc) + "\n", encoding="utf-8")
+
 def train_teacher(
     manifest_dir: str | Path,
     output: str | Path,
@@ -111,7 +156,9 @@ def train_teacher(
     loaders = _roi_loaders(Path(manifest_dir), image_size, batch_size, "train", ("landmark", "pose"))
     optimizer = torch.optim.AdamW(teacher.parameters(), lr=lr)
     history = []
+    log_path = output / "teacher_train.log"
     tasks = tuple(loaders)
+    log_path.write_text(f"{datetime.now().isoformat(timespec='seconds')} teacher training start\n", encoding="utf-8")
     for epoch in range(epochs):
         totals, counts = {}, {}
         for _ in range(steps_per_epoch):
@@ -125,7 +172,13 @@ def train_teacher(
             optimizer.step()
             totals[task] = totals.get(task, 0.0) + float(loss.detach())
             counts[task] = counts.get(task, 0) + 1
-        history.append({task: totals[task] / counts[task] for task in totals})
+        epoch_metrics = {task: totals[task] / counts[task] for task in totals}
+        history.append(epoch_metrics)
+        message = f"{datetime.now().isoformat(timespec='seconds')} epoch={epoch + 1}/{epochs} " + " ".join(f"{task}_loss={value:.6f}" for task, value in sorted(epoch_metrics.items()))
+        print(message, flush=True)
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(message + "\n")
+        _write_teacher_artifacts(output, history)
         torch.save(
             {
                 "model": teacher.state_dict(),
@@ -139,7 +192,7 @@ def train_teacher(
             },
             output / "teacher.pt",
         )
-    (output / "teacher_train_metrics.json").write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
+    _write_teacher_artifacts(output, history)
     return output / "teacher.pt"
 
 
@@ -184,6 +237,9 @@ def train_roi(
     output.mkdir(parents=True, exist_ok=True)
     device_obj = torch.device(device)
     model.to(device_obj).train()
+    shape_prior = ShapeBayesPrior.from_json(Path(manifest_dir) / "shape_prior.json")
+    if shape_prior is not None:
+        model.dms_criterion.shape_prior = shape_prior.to(device_obj)
     if teacher is not None:
         teacher.to(device_obj).freeze()
     loaders = _roi_loaders(Path(manifest_dir), image_size, batch_size, "train")
@@ -289,3 +345,7 @@ def main() -> None:
                 kd_heatmap_weight=args.kd_heatmap_weight,
             )
         )
+
+
+if __name__ == "__main__":
+    main()

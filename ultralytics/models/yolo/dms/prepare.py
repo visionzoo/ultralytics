@@ -14,6 +14,7 @@ import yaml
 
 from .data import dsm_image_path, dsm_manifest_entry, iter_dsm, iter_eye12, parse_300wlp_mat
 from .schema import is_face_label, normalized_label
+from dms.shape_bayes import fit_shape_prior
 
 
 GLOBAL_NAMES = ("face", "phone", "cigarette")
@@ -162,6 +163,14 @@ def build_manifests(
             ),
         ),
     }
+    eye_rows = [
+        {"points": record.points}
+        for source in _eye12_sources(eye12_root)
+        for record in iter_eye12(source)
+    ]
+    (output / "shape_prior.json").write_text(
+        json.dumps(fit_shape_prior(eye_rows), indent=2) + "\n", encoding="utf-8"
+    )
     (output / "summary.json").write_text(json.dumps(counts, indent=2) + "\n", encoding="utf-8")
     if global_yolo_output:
         counts["global_yolo"] = str(

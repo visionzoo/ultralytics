@@ -58,6 +58,7 @@ class DMSROIHeads(nn.Module):
         self.landmark = nn.Sequential(
             nn.ConvTranspose2d(channels, channels // 2, 2, 2), nn.SiLU(), nn.Conv2d(channels // 2, 12, 1)
         )
+        self.landmark_logvar = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, 12))
         self.pose = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, 64), nn.SiLU(), nn.Linear(64, 3))
 
     def forward(
@@ -74,6 +75,7 @@ class DMSROIHeads(nn.Module):
                 "eye_state_logits": empty.new_empty((0, 2, self.eye_states)),
                 "mouth_state_logits": empty.new_empty((0, 1, self.mouth_states)),
                 "landmark_heatmap": empty.new_empty((0, 12, 64, 64)),
+                "landmark_logvar": empty.new_empty((0, 12)),
                 "pose_ypr": empty.new_empty((0, 3)),
             }
         p3_rois = nn.functional.interpolate(p3_rois, size=(32, 32), mode="bilinear", align_corners=False)
@@ -86,6 +88,7 @@ class DMSROIHeads(nn.Module):
             "eye_state_logits": self.eye_state(face).reshape(count, 2, self.eye_states),
             "mouth_state_logits": self.mouth_state(face).reshape(count, 1, self.mouth_states),
             "landmark_heatmap": self.landmark(face),
+            "landmark_logvar": self.landmark_logvar(face).clamp(-4.0, 4.0),
             "pose_ypr": self.pose(face),
         }
         if roi_valid is not None:

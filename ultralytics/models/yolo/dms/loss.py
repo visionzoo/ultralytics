@@ -11,9 +11,10 @@ from torch import nn
 class DMSROILoss(nn.Module):
     """Masked fixed-part, heatmap and pose losses for partially labelled batches."""
 
-    def __init__(self, heatmap_sigma: float = 1.5):
+    def __init__(self, heatmap_sigma: float = 1.5, shape_prior=None):
         super().__init__()
         self.heatmap_sigma = heatmap_sigma
+        self.shape_prior = shape_prior
 
     @staticmethod
     def _zero(outputs: Mapping[str, torch.Tensor]) -> torch.Tensor:
@@ -32,6 +33,14 @@ class DMSROILoss(nn.Module):
         py = points[..., 1].unsqueeze(-1).unsqueeze(-1) * (height - 1)
         target = torch.exp(-((x - px).square() + (y - py).square()) / (2 * self.heatmap_sigma**2))
         return target * valid.to(dtype=target.dtype).unsqueeze(-1).unsqueeze(-1)
+
+    @staticmethod
+    def _softargmax(logits: torch.Tensor) -> torch.Tensor:
+        height, width = logits.shape[-2:]
+        probabilities = logits.flatten(-2).softmax(-1).reshape(*logits.shape[:2], height, width)
+        x = torch.linspace(0, 1, width, device=logits.device, dtype=logits.dtype)
+        y = torch.linspace(0, 1, height, device=logits.device, dtype=logits.dtype)
+        return torch.stack((probabilities.sum(-2) @ x, probabilities.sum(-1) @ y), dim=-1)
 
     @staticmethod
     def _state_loss(logits: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
@@ -63,7 +72,10 @@ class DMSROILoss(nn.Module):
             logits, points, valid = outputs["landmark_heatmap"], batch["landmark_xy"], batch["landmark_valid"].bool()
             target = self._heatmap_target(points, valid, logits.shape[-2], logits.shape[-1])
             heatmap_error = nn.functional.mse_loss(logits.sigmoid(), target, reduction="none").mean((-1, -2))
-            losses["landmark"] = self._masked_mean(heatmap_error, valid)
+            logvar = outputs.get("landmark_logvar", logits.new_zeros(logits.shape[:2])).clamp(-4.0, 4.0)
+            losses["landmark"] = self._masked_mean(torch.exp(-logvar) * heatmap_error + logvar, valid)
+            if self.shape_prior is not None:
+                losses["shape_prior"] = self.shape_prior(self._softargmax(logits), valid)
         if "pose_ypr" in batch and "pose_valid" in batch:
             valid = batch["pose_valid"].bool()
             pose_error = nn.functional.smooth_l1_loss(outputs["pose_ypr"], batch["pose_ypr"], reduction="none").mean(-1)
