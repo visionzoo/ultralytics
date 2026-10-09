@@ -47,8 +47,40 @@ def _cycle(loader: DataLoader) -> Iterator[dict]:
         yield from loader
 
 
+def _cuda_devices(spec: str) -> tuple[torch.device, list[int]]:
+    """Return the primary device and CUDA ids for a compact single-process trainer."""
+    value = str(spec).strip()
+    if not value.startswith("cuda"):
+        return torch.device(value), []
+    ids = value.split(":", 1)[1] if ":" in value else "0"
+    device_ids = [int(item) for item in ids.split(",") if item.strip()]
+    if not device_ids:
+        device_ids = [0]
+    return torch.device(f"cuda:{device_ids[0]}"), device_ids
+
+
+def _parallel(module: torch.nn.Module, device_ids: list[int]) -> torch.nn.Module:
+    if len(device_ids) > 1:
+        return torch.nn.DataParallel(module, device_ids=device_ids)
+    return module
+
+
+class _ROIForward(torch.nn.Module):
+    """DataParallel adapter that rebuilds local ROI batch indices per GPU."""
+
+    def __init__(self, model: DMSModel):
+        super().__init__()
+        self.model = model
+
+    def forward(self, image: torch.Tensor, face_boxes: torch.Tensor, roi_valid: torch.Tensor | None = None):
+        indexes = torch.arange(face_boxes.shape[0], device=face_boxes.device, dtype=face_boxes.dtype).unsqueeze(1)
+        rois = torch.cat((indexes, face_boxes), dim=1)
+        return self.model.forward_dms(image, rois, roi_valid)
+
+
 def _roi_loaders(
-    manifest_dir: Path, image_size: int, batch_size: int, split: str, tasks: tuple[str, ...] | None = None
+    manifest_dir: Path, image_size: int, batch_size: int, split: str, tasks: tuple[str, ...] | None = None,
+    workers: int = 0,
 ) -> dict[str, Iterator[dict]]:
     sources = {"parts": "dsm.jsonl", "landmark": "eye12.jsonl", "pose": "pose.jsonl"}
     loaders = {}
@@ -57,7 +89,11 @@ def _roi_loaders(
         path = manifest_dir / filename
         if path.is_file() and path.stat().st_size:
             dataset = DMSROIDataset(path, task, image_size, split)
-            loaders[task] = _cycle(DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_roi))
+            loaders[task] = _cycle(DataLoader(
+                dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_roi,
+                num_workers=workers, pin_memory=torch.cuda.is_available(),
+                persistent_workers=workers > 0,
+            ))
     if not loaders:
         raise ValueError(f"no usable ROI manifests in {manifest_dir}")
     return loaders
@@ -151,14 +187,16 @@ def train_teacher(
     crop_size: int = 128,
     lr: float = 1e-4,
     device: str = "cpu",
+    workers: int = 0,
 ) -> Path:
     """Train the RGB crop teacher on only landmark and pose train samples."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    device_obj = torch.device(device)
+    device_obj, device_ids = _cuda_devices(device)
     teacher = CropTeacher().to(device_obj).train()
+    teacher_parallel = _parallel(teacher, device_ids)
     criterion = DMSROILoss()
-    loaders = _roi_loaders(Path(manifest_dir), image_size, batch_size, "train", ("landmark", "pose"))
+    loaders = _roi_loaders(Path(manifest_dir), image_size, batch_size, "train", ("landmark", "pose"), workers)
     optimizer = torch.optim.AdamW(teacher.parameters(), lr=lr)
     history = []
     log_path = output / "teacher_train.log"
@@ -171,7 +209,7 @@ def train_teacher(
             batch = _device_batch(next(loaders[task]), device_obj)
             batch["img"] = batch["img"].float() / 255
             optimizer.zero_grad(set_to_none=True)
-            outputs = teacher(make_teacher_crops(batch["img"], batch["face_rois"], crop_size))
+            outputs = teacher_parallel(make_teacher_crops(batch["img"], batch["face_rois"], crop_size))
             loss, _ = criterion(outputs, batch)
             loss.backward()
             optimizer.step()
@@ -203,13 +241,17 @@ def train_teacher(
 
 def _student_roi_loss(
     model: DMSModel,
+    roi_forward: torch.nn.Module | None,
     batch: dict,
     teacher: CropTeacher | None,
     teacher_crop_size: int,
     kd_feature_weight: float,
     kd_heatmap_weight: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    outputs = model.forward_dms(batch["img"], batch["face_rois"], batch.get("roi_valid"))
+    if roi_forward is None:
+        outputs = model.forward_dms(batch["img"], batch["face_rois"], batch.get("roi_valid"))
+    else:
+        outputs = roi_forward(batch["img"], batch["face_rois"][:, 1:], batch.get("roi_valid"))
     total, items = model.dms_criterion(outputs, batch)
     valid = _teacher_valid(batch)
     if teacher is not None and valid.any():
@@ -236,11 +278,12 @@ def train_roi(
     teacher_crop_size: int = 128,
     kd_feature_weight: float = 1.0,
     kd_heatmap_weight: float = 1.0,
+    workers: int = 0,
 ) -> Path:
     """Train heterogeneous ROI batches; global detector training stays with DetectionTrainer."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    device_obj = torch.device(device)
+    device_obj, device_ids = _cuda_devices(device)
     model.to(device_obj).train()
     # ROI fine-tuning must not move the global detector/backbone.  The deploy
     # checkpoint intentionally takes those weights from global best.pt.
@@ -250,17 +293,23 @@ def train_roi(
     model.dms_heads.train()
     for parameter in model.dms_heads.parameters():
         parameter.requires_grad_(True)
+    # Materialize LazyConv2d before constructing the optimizer/DataParallel.
+    with torch.inference_mode():
+        dummy = torch.zeros(1, 3, image_size, image_size, device=device_obj)
+        dummy_roi = torch.tensor([[0.0, 0.0, 0.0, float(image_size), float(image_size)]], device=device_obj)
+        model.forward_dms(dummy, dummy_roi, torch.ones(1, dtype=torch.bool, device=device_obj))
     shape_prior = ShapeBayesPrior.from_json(Path(manifest_dir) / "shape_prior.json")
     if shape_prior is not None:
         model.dms_criterion.shape_prior = shape_prior.to(device_obj)
     if teacher is not None:
         teacher.to(device_obj).freeze()
-    loaders = _roi_loaders(Path(manifest_dir), image_size, batch_size, "train")
+    loaders = _roi_loaders(Path(manifest_dir), image_size, batch_size, "train", workers=workers)
     task_weights = task_weights or {task: 1.0 for task in loaders}
     tasks = [task for task in loaders if task_weights.get(task, 0) > 0]
     if not tasks:
         raise ValueError("all ROI task weights are zero")
     optimizer = torch.optim.AdamW((param for param in model.parameters() if param.requires_grad), lr=lr)
+    roi_forward = _parallel(_ROIForward(model), device_ids)
     history = []
     for epoch in range(epochs):
         totals, counts = {}, {}
@@ -270,7 +319,7 @@ def train_roi(
             batch["img"] = batch["img"].float() / 255
             optimizer.zero_grad(set_to_none=True)
             loss, items = _student_roi_loss(
-                model, batch, teacher, teacher_crop_size, kd_feature_weight, kd_heatmap_weight
+                model, roi_forward, batch, teacher, teacher_crop_size, kd_feature_weight, kd_heatmap_weight
             )
             loss.backward()
             optimizer.step()
@@ -288,7 +337,7 @@ def evaluate_roi(
     model: DMSModel, manifest_dir: str | Path, batch_size: int, image_size: int, batches_per_task: int, device: str = "cpu"
 ) -> dict[str, float]:
     """Evaluate mean supervised ROI loss per task; metric heads are added separately."""
-    device_obj = torch.device(device)
+    device_obj, _ = _cuda_devices(device)
     model.to(device_obj).eval()
     results = {}
     for task, loader in _roi_loaders(Path(manifest_dir), image_size, batch_size, "test").items():
@@ -313,6 +362,7 @@ def main() -> None:
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--steps-per-epoch", type=int, default=100)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--train-teacher", action="store_true")
     parser.add_argument("--teacher-weights", type=Path)
@@ -331,6 +381,7 @@ def main() -> None:
                 args.steps_per_epoch,
                 args.teacher_crop_size,
                 device=args.device,
+                workers=args.workers,
             )
         )
         return
@@ -356,6 +407,7 @@ def main() -> None:
                 teacher_crop_size=args.teacher_crop_size,
                 kd_feature_weight=args.kd_feature_weight,
                 kd_heatmap_weight=args.kd_heatmap_weight,
+                workers=args.workers,
             )
         )
 
