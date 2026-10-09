@@ -293,14 +293,14 @@ def train_roi(
     model.model.eval()
     for parameter in model.model.parameters():
         parameter.requires_grad_(False)
-    model.dms_heads.train()
-    for parameter in model.dms_heads.parameters():
-        parameter.requires_grad_(True)
     # Materialize LazyConv2d before constructing the optimizer/DataParallel.
     with torch.inference_mode():
         dummy = torch.zeros(1, 3, image_size, image_size, device=device_obj)
         dummy_roi = torch.tensor([[0.0, 0.0, 0.0, float(image_size), float(image_size)]], device=device_obj)
         model.forward_dms(dummy, dummy_roi, torch.ones(1, dtype=torch.bool, device=device_obj))
+    model.dms_heads.train()
+    for parameter in model.dms_heads.parameters():
+        parameter.requires_grad_(True)
     shape_prior = ShapeBayesPrior.from_json(Path(manifest_dir) / "shape_prior.json")
     if shape_prior is not None:
         model.dms_criterion.shape_prior = shape_prior.to(device_obj)
