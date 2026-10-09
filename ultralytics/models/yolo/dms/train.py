@@ -294,7 +294,7 @@ def train_roi(
     for parameter in model.model.parameters():
         parameter.requires_grad_(False)
     # Materialize LazyConv2d before constructing the optimizer/DataParallel.
-    with torch.inference_mode():
+    with torch.no_grad():
         dummy = torch.zeros(1, 3, image_size, image_size, device=device_obj)
         dummy_roi = torch.tensor([[0.0, 0.0, 0.0, float(image_size), float(image_size)]], device=device_obj)
         model.forward_dms(dummy, dummy_roi, torch.ones(1, dtype=torch.bool, device=device_obj))
