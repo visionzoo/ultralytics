@@ -164,7 +164,15 @@ def build_manifests(
         ),
     }
     eye_rows = [
-        {"points": record.points}
+        {
+            "points": [
+                [
+                    (point[0] - record.crop_box.x1) / max(record.crop_box.width, 1.0),
+                    (point[1] - record.crop_box.y1) / max(record.crop_box.height, 1.0),
+                ]
+                for point in record.points
+            ]
+        }
         for source in _eye12_sources(eye12_root)
         for record in iter_eye12(source)
     ]
