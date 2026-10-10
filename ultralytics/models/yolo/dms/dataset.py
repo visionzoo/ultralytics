@@ -79,11 +79,12 @@ class DMSROIDataset(Dataset):
                 flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
                 borderMode=cv2.BORDER_REFLECT_101,
             )
-            inverse = cv2.invertAffineTransform(matrix)
             raw_points = np.asarray(sample["points"], dtype=np.float32)
-            # The inverse transform returns source-image coordinates; make
-            # them local to the cropped face-box canvas.
-            points = raw_points @ inverse[:, :2].T + inverse[:, 2] - crop_box[:2]
+            # Eye12 points are annotated in the original full-image frame.
+            # The affine matrix is only needed to reconstruct the aligned
+            # image back into its source crop; applying its inverse to the
+            # points would transform them a second time.
+            points = raw_points - crop_box[:2]
             face = np.asarray([[0, 0, crop_w, crop_h]], dtype=np.float32)
         source_face = face[0].copy()
         img, face = canonical_face_crop(image, face[0], self.image_size)
