@@ -73,7 +73,13 @@ class DMSROILoss(nn.Module):
             target = self._heatmap_target(points, valid, logits.shape[-2], logits.shape[-1])
             heatmap_error = nn.functional.mse_loss(logits.sigmoid(), target, reduction="none").mean((-1, -2))
             logvar = outputs.get("landmark_logvar", logits.new_zeros(logits.shape[:2])).clamp(-4.0, 4.0)
+            # Sparse pixel MSE alone admits the degenerate solution of pushing
+            # every heatmap logit negative.  Train the decoded coordinates
+            # directly as well, so a low loss means geometrically correct eyes.
+            decoded = self._softargmax(logits)
+            coordinate_error = nn.functional.smooth_l1_loss(decoded, points, reduction="none").mean(-1)
             losses["landmark"] = self._masked_mean(torch.exp(-logvar) * heatmap_error + logvar, valid)
+            losses["landmark_coord"] = 10.0 * self._masked_mean(coordinate_error, valid)
             if self.shape_prior is not None:
                 losses["shape_prior"] = self.shape_prior(self._softargmax(logits), valid)
         if "pose_ypr" in batch and "pose_valid" in batch:

@@ -332,6 +332,25 @@ def train_roi(
         checkpoint = {"model": model.state_dict(), "epoch": epoch + 1, "history": history}
         torch.save(checkpoint, output / "last.pt")
     (output / "roi_train_metrics.json").write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        tasks_seen = sorted({name for row in history for name in row})
+        fig, axes = plt.subplots(max(1, len(tasks_seen)), 1, figsize=(9, 3 * max(1, len(tasks_seen))), squeeze=False)
+        axes = [axis for row in axes for axis in row]
+        for axis, task in zip(axes, tasks_seen):
+            axis.plot(range(1, len(history) + 1), [row.get(task, float("nan")) for row in history])
+            axis.set_title(f"DMS ROI - {task} loss")
+            axis.set_xlabel("Epoch")
+            axis.set_ylabel("Loss")
+            axis.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(output / "roi_loss_curves.png", dpi=150)
+        plt.close(fig)
+    except Exception as exc:
+        (output / "roi_plot_error.txt").write_text(str(exc) + "\n", encoding="utf-8")
     return output / "last.pt"
 
 
