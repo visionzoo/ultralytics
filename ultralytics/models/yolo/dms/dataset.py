@@ -12,8 +12,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from ultralytics.data.augment import LetterBox
-
 from .schema import PART_SLOTS, is_face_label
 
 
@@ -21,18 +19,18 @@ def _box(values: list[float] | tuple[float, ...]) -> np.ndarray:
     return np.asarray(values, dtype=np.float32)
 
 
-def _letterbox(image: np.ndarray, boxes: np.ndarray, image_size: int) -> tuple[torch.Tensor, np.ndarray]:
-    """Use Ultralytics LetterBox and apply the same recorded affine to xyxy boxes."""
-    transform = LetterBox(new_shape=(image_size, image_size), auto=False, scaleup=True, stride=32)
-    params = transform.get_params({"img": image})
-    resized = transform(image=image)
-    ratio, left, top = params["ratio"][0], params["left"], params["top"]
-    if boxes.size:
-        boxes = boxes.copy()
-        boxes[:, [0, 2]] = boxes[:, [0, 2]] * ratio + left
-        boxes[:, [1, 3]] = boxes[:, [1, 3]] * ratio + top
+def _canonical_face_crop(image: np.ndarray, face: np.ndarray, image_size: int) -> tuple[torch.Tensor, np.ndarray]:
+    """Crop the annotated face ROI and use the same square canonical ROI everywhere."""
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = face.astype(np.float32)
+    x1, y1 = max(0, int(np.floor(x1))), max(0, int(np.floor(y1)))
+    x2, y2 = min(width, int(np.ceil(x2))), min(height, int(np.ceil(y2)))
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError(f"invalid face ROI {(x1, y1, x2, y2)}")
+    crop = image[y1:y2, x1:x2]
+    resized = cv2.resize(crop, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
     tensor = torch.from_numpy(np.ascontiguousarray(resized[..., ::-1].transpose(2, 0, 1)))
-    return tensor, boxes
+    return tensor, np.asarray([0, 0, image_size, image_size], dtype=np.float32)
 
 
 class DMSROIDataset(Dataset):
@@ -78,11 +76,11 @@ class DMSROIDataset(Dataset):
         if image is None:
             raise FileNotFoundError(sample["image"])
         face = _box(sample["face_box_xyxy"]).reshape(1, 4)
-        img, face = _letterbox(image, face, self.image_size)
+        img, face = _canonical_face_crop(image, face[0], self.image_size)
         result: dict[str, Any] = {
             "task": self.task,
             "img": img,
-            "face_box": torch.from_numpy(face[0]),
+            "face_box": torch.from_numpy(face),
         }
         if self.task == "landmark":
             points = torch.tensor(sample["points"], dtype=torch.float32)
