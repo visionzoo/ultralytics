@@ -80,7 +80,9 @@ class DMSROIDataset(Dataset):
             )
             inverse = cv2.invertAffineTransform(matrix)
             raw_points = np.asarray(sample["points"], dtype=np.float32)
-            points = raw_points @ inverse[:, :2].T + inverse[:, 2]
+            # The inverse transform returns source-image coordinates; make
+            # them local to the cropped face-box canvas.
+            points = raw_points @ inverse[:, :2].T + inverse[:, 2] - crop_box[:2]
             face = np.asarray([[0, 0, crop_w, crop_h]], dtype=np.float32)
         img, face = canonical_face_crop(image, face[0], self.image_size)
         result: dict[str, Any] = {
