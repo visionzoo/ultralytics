@@ -85,6 +85,7 @@ class DMSROIDataset(Dataset):
             # them local to the cropped face-box canvas.
             points = raw_points @ inverse[:, :2].T + inverse[:, 2] - crop_box[:2]
             face = np.asarray([[0, 0, crop_w, crop_h]], dtype=np.float32)
+        source_face = face[0].copy()
         img, face = canonical_face_crop(image, face[0], self.image_size)
         result: dict[str, Any] = {
             "task": self.task,
@@ -93,7 +94,7 @@ class DMSROIDataset(Dataset):
         }
         if self.task == "landmark":
             points = torch.tensor(sample["points"] if points is None else points, dtype=torch.float32)
-            original_face = _box(sample["face_box_xyxy"])
+            original_face = _box(source_face)
             result["landmark_xy"] = (points - original_face[:2]) / (original_face[2:] - original_face[:2]).clip(min=1)
             result["landmark_valid"] = torch.ones(12, dtype=torch.bool)
         elif self.task == "pose":
