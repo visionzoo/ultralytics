@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterator
 
 import numpy as np
+import cv2
 
 from .schema import Box, DMSObject, PartAssociation, PartTarget, is_face_label, part_target
 
@@ -145,10 +146,18 @@ def parse_300wlp_mat(path: str | Path) -> PoseRecord:
     if roi.size < 4 or pose.size < 3:
         raise ValueError(f"invalid 300W-LP annotation: {mat_path}")
     pitch, yaw, roll = np.degrees(pose[:3])
-    # 300W-LP stores roi as [x, y, width, height], not xyxy.
-    x, y, width, height = map(float, roi[:4])
+    # 300W-LP's generated JPG is already a 450x450 canonical crop.  The MAT
+    # ``roi`` belongs to the pre-crop source image, so it must not be applied
+    # to the generated JPG coordinates.  Use the actual generated image bounds
+    # as the ROI; this is the same full-frame contract used by deployment after
+    # its face crop.
+    image_path = mat_path.with_suffix(".jpg")
+    image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+    if image is None or image.ndim < 2:
+        raise ValueError(f"missing 300W-LP image for annotation: {image_path}")
+    height, width = image.shape[:2]
     return PoseRecord(
-        mat_path.with_suffix(".jpg"), Box(x, y, x + width, y + height), (float(yaw), float(pitch), float(roll))
+        image_path, Box(0.0, 0.0, float(width), float(height)), (float(yaw), float(pitch), float(roll))
     )
 
 
