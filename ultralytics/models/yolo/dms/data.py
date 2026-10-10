@@ -145,7 +145,11 @@ def parse_300wlp_mat(path: str | Path) -> PoseRecord:
     if roi.size < 4 or pose.size < 3:
         raise ValueError(f"invalid 300W-LP annotation: {mat_path}")
     pitch, yaw, roll = np.degrees(pose[:3])
-    return PoseRecord(mat_path.with_suffix(".jpg"), Box(*map(float, roi[:4])), (float(yaw), float(pitch), float(roll)))
+    # 300W-LP stores roi as [x, y, width, height], not xyxy.
+    x, y, width, height = map(float, roi[:4])
+    return PoseRecord(
+        mat_path.with_suffix(".jpg"), Box(x, y, x + width, y + height), (float(yaw), float(pitch), float(roll))
+    )
 
 
 def write_association_audit(path: str | Path, records: Iterator[tuple[VOCRecord, tuple[PartAssociation, ...]]]) -> None:
