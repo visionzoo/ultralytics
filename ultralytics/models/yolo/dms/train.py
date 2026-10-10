@@ -349,6 +349,16 @@ def train_roi(
             counts[task] = counts.get(task, 0) + 1
         history.append({task: totals[task] / counts[task] for task in totals})
         validation_history.append(_evaluate_roi_epoch(model, Path(manifest_dir), image_size, batch_size, device_obj))
+        print(
+            f"{datetime.now().isoformat(timespec='seconds')} epoch={epoch + 1}/{epochs} "
+            f"train={history[-1]} val={validation_history[-1]}",
+            flush=True,
+        )
+        # Keep metrics inspectable while a long run is still in progress.
+        (output / "roi_train_metrics.json").write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
+        (output / "roi_validation_metrics.json").write_text(
+            json.dumps(validation_history, indent=2) + "\n", encoding="utf-8"
+        )
         checkpoint = {
             "model": model.state_dict(),
             "epoch": epoch + 1,
