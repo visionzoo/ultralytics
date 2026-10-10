@@ -146,6 +146,8 @@ def build_manifests(
                     "image": str(record.image),
                     "points": record.points,
                     "face_box_xyxy": [0, 0, record.input_size, record.input_size],
+                    "crop_box_xyxy": list(vars(record.crop_box).values()),
+                    "alignment_matrix": record.alignment_matrix,
                     "split": record.split,
                 }
                 for source in _eye12_sources(eye12_root)

@@ -63,6 +63,25 @@ class DMSROIDataset(Dataset):
         if image is None:
             raise FileNotFoundError(sample["image"])
         face = _box(sample["face_box_xyxy"]).reshape(1, 4)
+        points = None
+        if self.task == "landmark" and sample.get("alignment_matrix") and sample.get("crop_box_xyxy"):
+            # Eye12 stores an aligned 128px crop.  Undo its recorded affine
+            # alignment so training sees the same face-box geometry as deploy.
+            crop_box = _box(sample["crop_box_xyxy"])
+            crop_w = max(1, int(round(crop_box[2] - crop_box[0])))
+            crop_h = max(1, int(round(crop_box[3] - crop_box[1])))
+            matrix = np.asarray(sample["alignment_matrix"], dtype=np.float32)
+            image = cv2.warpAffine(
+                image,
+                matrix,
+                (crop_w, crop_h),
+                flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                borderMode=cv2.BORDER_REFLECT_101,
+            )
+            inverse = cv2.invertAffineTransform(matrix)
+            raw_points = np.asarray(sample["points"], dtype=np.float32)
+            points = raw_points @ inverse[:, :2].T + inverse[:, 2]
+            face = np.asarray([[0, 0, crop_w, crop_h]], dtype=np.float32)
         img, face = canonical_face_crop(image, face[0], self.image_size)
         result: dict[str, Any] = {
             "task": self.task,
@@ -70,7 +89,7 @@ class DMSROIDataset(Dataset):
             "face_box": torch.from_numpy(face),
         }
         if self.task == "landmark":
-            points = torch.tensor(sample["points"], dtype=torch.float32)
+            points = torch.tensor(sample["points"] if points is None else points, dtype=torch.float32)
             original_face = _box(sample["face_box_xyxy"])
             result["landmark_xy"] = (points - original_face[:2]) / (original_face[2:] - original_face[:2]).clip(min=1)
             result["landmark_valid"] = torch.ones(12, dtype=torch.bool)

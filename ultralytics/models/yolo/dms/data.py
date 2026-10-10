@@ -30,6 +30,7 @@ class Eye12Record:
     crop_box: Box
     input_size: int
     split: str
+    alignment_matrix: list[list[float]] | None
 
 
 @dataclass(frozen=True)
@@ -123,7 +124,12 @@ def iter_eye12(jsonl_path: str | Path) -> Iterator[Eye12Record]:
                 raise ValueError(f"expected 12 points at {jsonl_path}:{line_number}")
             crop = item["crop_box_xyxy"]
             yield Eye12Record(
-                Path(item["image"]), points, Box(*(float(v) for v in crop)), int(item.get("input_size", 128)), item.get("split", "")
+                Path(item["image"]),
+                points,
+                Box(*(float(v) for v in crop)),
+                int(item.get("input_size", 128)),
+                item.get("split", ""),
+                item.get("alignment_matrix"),
             )
 
 
