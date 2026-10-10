@@ -266,6 +266,24 @@ def _student_roi_loss(
     return total, items
 
 
+@torch.no_grad()
+def _evaluate_roi_epoch(
+    model: DMSModel, manifest_dir: Path, image_size: int, batch_size: int, device: torch.device
+) -> dict[str, float]:
+    """Evaluate one small deterministic test pass after each ROI epoch."""
+    model.eval()
+    results: dict[str, float] = {}
+    for task, loader in _roi_loaders(manifest_dir, image_size, batch_size, "test", workers=0).items():
+        batch = _device_batch(next(loader), device)
+        batch["img"] = batch["img"].float() / 255
+        _, items = model.loss(batch)
+        for name, value in items.items():
+            results[f"{task}/{name}"] = float(value)
+    model.model.eval()
+    model.dms_heads.train()
+    return results
+
+
 def train_roi(
     model: DMSModel,
     manifest_dir: str | Path,
@@ -314,6 +332,7 @@ def train_roi(
     optimizer = torch.optim.AdamW((param for param in model.parameters() if param.requires_grad), lr=lr)
     roi_forward = _parallel(_ROIForward(model), device_ids)
     history = []
+    validation_history = []
     for epoch in range(epochs):
         totals, counts = {}, {}
         for _ in range(steps_per_epoch):
@@ -329,9 +348,16 @@ def train_roi(
             totals[task] = totals.get(task, 0.0) + float(loss.detach())
             counts[task] = counts.get(task, 0) + 1
         history.append({task: totals[task] / counts[task] for task in totals})
-        checkpoint = {"model": model.state_dict(), "epoch": epoch + 1, "history": history}
+        validation_history.append(_evaluate_roi_epoch(model, Path(manifest_dir), image_size, batch_size, device_obj))
+        checkpoint = {
+            "model": model.state_dict(),
+            "epoch": epoch + 1,
+            "history": history,
+            "validation_history": validation_history,
+        }
         torch.save(checkpoint, output / "last.pt")
     (output / "roi_train_metrics.json").write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
+    (output / "roi_validation_metrics.json").write_text(json.dumps(validation_history, indent=2) + "\n", encoding="utf-8")
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -348,6 +374,18 @@ def train_roi(
             axis.grid(True, alpha=0.3)
         fig.tight_layout()
         fig.savefig(output / "roi_loss_curves.png", dpi=150)
+        plt.close(fig)
+        val_names = sorted({name for row in validation_history for name in row})
+        fig, axes = plt.subplots(max(1, len(val_names)), 1, figsize=(9, 3 * max(1, len(val_names))), squeeze=False)
+        axes = [axis for row in axes for axis in row]
+        for axis, name in zip(axes, val_names):
+            axis.plot(range(1, len(validation_history) + 1), [row.get(name, float("nan")) for row in validation_history])
+            axis.set_title(f"DMS ROI validation - {name}")
+            axis.set_xlabel("Epoch")
+            axis.set_ylabel("Loss")
+            axis.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(output / "roi_validation_curves.png", dpi=150)
         plt.close(fig)
     except Exception as exc:
         (output / "roi_plot_error.txt").write_text(str(exc) + "\n", encoding="utf-8")
