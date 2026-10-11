@@ -24,6 +24,7 @@ LANDMARK_NAMES = (
     "right_eye_lower_right",
     "right_eye_lower_left",
 )
+ROI_INPUT_CONTRACT = "letterbox_feature_roi_v1"
 PART_SLOTS = ("left_eye", "right_eye", "mouth")
 PartName = Literal["eye", "mouth"]
 AssociationStatus = Literal["matched", "orphan", "ambiguous"]
