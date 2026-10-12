@@ -440,6 +440,7 @@ def main() -> None:
     parser.add_argument("--steps-per-epoch", type=int, default=100)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--train-teacher", action="store_true")
     parser.add_argument("--teacher-weights", type=Path)
@@ -459,6 +460,7 @@ def main() -> None:
                 args.teacher_crop_size,
                 device=args.device,
                 workers=args.workers,
+                lr=args.lr,
             )
         )
         return
@@ -485,6 +487,7 @@ def main() -> None:
                 kd_feature_weight=args.kd_feature_weight,
                 kd_heatmap_weight=args.kd_heatmap_weight,
                 workers=args.workers,
+                lr=args.lr,
             )
         )
 
