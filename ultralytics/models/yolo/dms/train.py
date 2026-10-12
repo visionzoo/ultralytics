@@ -30,6 +30,16 @@ from .teacher import CropTeacher, distillation_loss, make_teacher_crops
 from dms.shape_bayes import ShapeBayesPrior
 
 
+def _tensorboard_writer(log_dir: str | Path | None):
+    if not log_dir:
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except Exception:
+        return None
+    return SummaryWriter(str(log_dir))
+
+
 class DMSTrainer(DetectionTrainer):
     """Use DMSModel while retaining Ultralytics' normal detection trainer."""
 
@@ -198,6 +208,7 @@ def train_teacher(
     lr: float = 1e-4,
     device: str = "cpu",
     workers: int = 0,
+    tb_log_dir: str | Path | None = None,
 ) -> Path:
     """Train the RGB crop teacher on only landmark and pose train samples."""
     output = Path(output)
@@ -211,6 +222,7 @@ def train_teacher(
     amp_enabled = device_obj.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     history = []
+    writer = _tensorboard_writer(tb_log_dir)
     log_path = output / "teacher_train.log"
     tasks = tuple(loaders)
     log_path.write_text(f"{datetime.now().isoformat(timespec='seconds')} teacher training start\n", encoding="utf-8")
@@ -231,6 +243,9 @@ def train_teacher(
             counts[task] = counts.get(task, 0) + 1
         epoch_metrics = {task: totals[task] / counts[task] for task in totals}
         history.append(epoch_metrics)
+        if writer:
+            for task, value in epoch_metrics.items():
+                writer.add_scalar(f"teacher/{task}_loss", value, epoch + 1)
         message = f"{datetime.now().isoformat(timespec='seconds')} epoch={epoch + 1}/{epochs} " + " ".join(f"{task}_loss={value:.6f}" for task, value in sorted(epoch_metrics.items()))
         print(message, flush=True)
         with log_path.open("a", encoding="utf-8") as handle:
@@ -312,6 +327,7 @@ def train_roi(
     kd_heatmap_weight: float = 1.0,
     workers: int = 0,
     amp: bool = True,
+    tb_log_dir: str | Path | None = None,
 ) -> Path:
     """Train heterogeneous ROI batches; global detector training stays with DetectionTrainer."""
     output = Path(output)
@@ -347,6 +363,7 @@ def train_roi(
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     history = []
     validation_history = []
+    writer = _tensorboard_writer(tb_log_dir)
     for epoch in range(epochs):
         totals, counts = {}, {}
         for _ in range(steps_per_epoch):
@@ -367,6 +384,11 @@ def train_roi(
             counts[task] = counts.get(task, 0) + 1
         history.append({task: totals[task] / counts[task] for task in totals})
         validation_history.append(_evaluate_roi_epoch(model, Path(manifest_dir), image_size, batch_size, device_obj))
+        if writer:
+            for task, value in history[-1].items():
+                writer.add_scalar(f"roi/train/{task}", value, epoch + 1)
+            for name, value in validation_history[-1].items():
+                writer.add_scalar(f"roi/val/{name}", value, epoch + 1)
         print(
             f"{datetime.now().isoformat(timespec='seconds')} epoch={epoch + 1}/{epochs} "
             f"train={history[-1]} val={validation_history[-1]}",
@@ -453,6 +475,7 @@ def main() -> None:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--tb-log-dir")
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--train-teacher", action="store_true")
     parser.add_argument("--teacher-weights", type=Path)
@@ -473,6 +496,7 @@ def main() -> None:
                 device=args.device,
                 workers=args.workers,
                 lr=args.lr,
+                tb_log_dir=args.tb_log_dir,
             )
         )
         return
@@ -500,6 +524,7 @@ def main() -> None:
                 kd_heatmap_weight=args.kd_heatmap_weight,
                 workers=args.workers,
                 lr=args.lr,
+                tb_log_dir=args.tb_log_dir,
             )
         )
 
