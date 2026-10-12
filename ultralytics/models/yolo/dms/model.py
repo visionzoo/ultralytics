@@ -38,6 +38,7 @@ class DMSModel(DetectionModel):
             "roi_head": self.roi_head_name,
             "roi_kwargs": self.roi_head_kwargs,
             "feature_strides": list(self.feature_strides),
+            "landmark_decoder": "direct_xy_v1",
         }
         self.dms_criterion = DMSROILoss()
 
