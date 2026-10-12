@@ -2,8 +2,38 @@
 
 from __future__ import annotations
 
+import importlib
+
 import torch
 from torch import nn
+
+
+_ROI_HEAD_FACTORIES: dict[str, object] = {}
+
+
+def register_roi_head(name: str):
+    """Register a named ROI-head factory without changing DMSModel."""
+    def decorator(factory):
+        if name in _ROI_HEAD_FACTORIES:
+            raise KeyError(f"ROI head already registered: {name}")
+        _ROI_HEAD_FACTORIES[name] = factory
+        return factory
+
+    return decorator
+
+
+def build_roi_head(name: str = "default", **kwargs) -> nn.Module:
+    """Build a registered ROI head; external modules may register their own heads."""
+    if ":" in name:
+        module_name, class_name = name.split(":", 1)
+        factory = getattr(importlib.import_module(module_name), class_name)
+        return factory(**kwargs)
+    try:
+        factory = _ROI_HEAD_FACTORIES[name]
+    except KeyError as exc:
+        available = ", ".join(sorted(_ROI_HEAD_FACTORIES)) or "<none>"
+        raise KeyError(f"Unknown ROI head {name!r}; available: {available}") from exc
+    return factory(**kwargs)
 
 
 class DWBlock(nn.Module):
@@ -97,3 +127,6 @@ class DMSROIHeads(nn.Module):
             result["landmark_heatmap"] = result["landmark_heatmap"] * valid[:, :, None, None]
             result["pose_ypr"] = result["pose_ypr"] * valid
         return result
+
+
+register_roi_head("default")(DMSROIHeads)

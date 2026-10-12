@@ -98,6 +98,7 @@ def export_dms_onnx(
         "roi_input_contract": ROI_INPUT_CONTRACT,
         "image_size": image_size,
         "max_faces": max_faces,
+        "dms_architecture": model.dms_architecture,
         "roi_align": {"aligned": True, "b2_stride": 4, "p3_stride": 8, "b2_size": 32, "p3_size": 16},
         "part_slots": PART_SLOTS,
         "landmark_names": LANDMARK_NAMES,

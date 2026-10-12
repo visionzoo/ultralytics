@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ultralytics.nn.modules.dms import DMSROIHeads, roi_align_features
+from ultralytics.nn.modules.dms import build_roi_head, roi_align_features
 from ultralytics.nn.tasks import DetectionModel
 
 from .loss import DMSROILoss
@@ -26,7 +26,19 @@ class DMSModel(DetectionModel):
 
     def __init__(self, cfg="yolo26n.yaml", ch=3, nc=None, verbose=True):
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
-        self.dms_heads = DMSROIHeads()
+        yaml_cfg = getattr(self, "yaml", {})
+        dms_cfg = yaml_cfg.get("dms", {}) if isinstance(yaml_cfg, dict) else {}
+        self.feature_strides = tuple(int(value) for value in dms_cfg.get("feature_strides", (4, 8)))
+        if len(self.feature_strides) != 2 or len(set(self.feature_strides)) != 2:
+            raise ValueError("dms.feature_strides must contain exactly two distinct strides")
+        self.roi_head_name = str(dms_cfg.get("roi_head", "default"))
+        self.roi_head_kwargs = dict(dms_cfg.get("roi_kwargs", {}))
+        self.dms_heads = build_roi_head(self.roi_head_name, **self.roi_head_kwargs)
+        self.dms_architecture = {
+            "roi_head": self.roi_head_name,
+            "roi_kwargs": self.roi_head_kwargs,
+            "feature_strides": list(self.feature_strides),
+        }
         self.dms_criterion = DMSROILoss()
 
     @staticmethod
@@ -37,7 +49,7 @@ class DMSModel(DetectionModel):
         return height_stride if height_stride == width_stride else None
 
     def forward_encoder(self, image: torch.Tensor) -> EncoderOutput:
-        """Execute the normal YOLO graph once and retain its final s4 and s8 maps."""
+        """Execute the normal YOLO graph once and retain configured feature maps."""
         saved, x, features = [], image, {}
         for layer in self.model:
             if layer.f != -1:
@@ -46,11 +58,13 @@ class DMSModel(DetectionModel):
             saved.append(x)
             if isinstance(x, torch.Tensor):
                 stride = self._stride_for(image, x)
-                if stride in (4, 8):
+                if stride in self.feature_strides:
                     features[stride] = x
-        if 4 not in features or 8 not in features:
-            raise RuntimeError("YOLO graph did not expose required B2/P3 feature maps")
-        return EncoderOutput(x, features[4], features[8], 4, 8)
+        missing = [stride for stride in self.feature_strides if stride not in features]
+        if missing:
+            raise RuntimeError(f"YOLO graph did not expose configured feature strides: {missing}")
+        first, second = self.feature_strides
+        return EncoderOutput(x, features[first], features[second], first, second)
 
     def forward_roi(
         self, b2_rois: torch.Tensor, p3_rois: torch.Tensor, roi_valid: torch.Tensor | None = None

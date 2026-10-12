@@ -124,11 +124,18 @@ def load_dms_weights(model: DMSModel, weights: str | Path | None) -> DMSModel:
     stored = checkpoint.get("model") if isinstance(checkpoint, dict) else checkpoint
     if isinstance(stored, dict):
         if any(key.startswith("dms_heads.") for key in stored):
-            contract = checkpoint.get("metadata", {}).get("roi_input_contract")
+            metadata = checkpoint.get("metadata", {})
+            contract = metadata.get("roi_input_contract")
             if contract != ROI_INPUT_CONTRACT:
                 raise ValueError(
                     "DMS ROI checkpoint uses the old pixel-crop encoder contract. "
                     "Reuse the global detector and retrain ROI heads with dms-roi-train before merging."
+                )
+            stored_architecture = metadata.get("dms_architecture")
+            if stored_architecture and stored_architecture != model.dms_architecture:
+                raise ValueError(
+                    "DMS ROI checkpoint architecture does not match the configured model: "
+                    f"checkpoint={stored_architecture}, model={model.dms_architecture}"
                 )
         model.load_state_dict(stored, strict=False)
     else:
@@ -401,7 +408,10 @@ def train_roi(
         )
         checkpoint = {
             "model": model.state_dict(),
-            "metadata": {"roi_input_contract": ROI_INPUT_CONTRACT},
+            "metadata": {
+                "roi_input_contract": ROI_INPUT_CONTRACT,
+                "dms_architecture": model.dms_architecture,
+            },
             "epoch": epoch + 1,
             "history": history,
             "validation_history": validation_history,
