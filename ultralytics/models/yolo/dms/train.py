@@ -137,10 +137,6 @@ def load_dms_weights(model: DMSModel, weights: str | Path | None) -> DMSModel:
                     "DMS ROI checkpoint architecture does not match the configured model: "
                     f"checkpoint={stored_architecture}, model={model.dms_architecture}"
                 )
-            if not any(key.startswith("dms_heads.landmark_xy.") for key in stored):
-                raise ValueError(
-                    "DMS ROI checkpoint predates direct landmark coordinate regression; retrain ROI heads."
-                )
         model.load_state_dict(stored, strict=False)
     else:
         model.load(checkpoint)

@@ -43,7 +43,6 @@ class ROIHeadsExport(nn.Module):
             output["eye_state_logits"],
             output["mouth_state_logits"],
             output["landmark_heatmap"],
-            output["landmark_xy"],
             output["landmark_logvar"],
             output["pose_ypr"],
         )
@@ -93,7 +92,7 @@ def export_dms_onnx(
         roi_path,
         opset_version=opset,
         input_names=["b2_rois", "p3_rois", "roi_valid"],
-        output_names=["part_box", "part_presence_logits", "eye_state_logits", "mouth_state_logits", "landmark_heatmap", "landmark_xy", "landmark_logvar", "pose_ypr"],
+        output_names=["part_box", "part_presence_logits", "eye_state_logits", "mouth_state_logits", "landmark_heatmap", "landmark_logvar", "pose_ypr"],
     )
     manifest = {
         "schema_version": 1,

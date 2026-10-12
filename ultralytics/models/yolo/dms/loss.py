@@ -44,6 +44,23 @@ class DMSROILoss(nn.Module):
         return torch.stack((probabilities.sum(-2) @ x, probabilities.sum(-1) @ y), dim=-1)
 
     @staticmethod
+    def decode_heatmap(logits: torch.Tensor, radius: int = 2, temperature: float = 0.25) -> torch.Tensor:
+        """Decode a heatmap with a local subpixel soft-argmax around its peak."""
+        _, _, height, width = logits.shape
+        peaks = logits.flatten(-2).argmax(-1)
+        cx, cy = peaks % width, peaks // width
+        yy, xx = torch.meshgrid(
+            torch.arange(height, device=logits.device),
+            torch.arange(width, device=logits.device), indexing="ij"
+        )
+        local = ((xx[None, None] - cx[..., None, None]).abs() <= radius) & ((yy[None, None] - cy[..., None, None]).abs() <= radius)
+        weights = (logits / temperature).masked_fill(~local, torch.finfo(logits.dtype).min).flatten(-2).softmax(-1)
+        weights = weights.reshape(logits.shape[0], logits.shape[1], height, width)
+        x = torch.linspace(0, 1, width, device=logits.device, dtype=logits.dtype)
+        y = torch.linspace(0, 1, height, device=logits.device, dtype=logits.dtype)
+        return torch.stack((weights.sum(-2) @ x, weights.sum(-1) @ y), dim=-1)
+
+    @staticmethod
     def _state_loss(logits: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """Avoid passing ignored ``-1`` labels to cross entropy."""
         if not valid.any():
@@ -72,15 +89,12 @@ class DMSROILoss(nn.Module):
         if "landmark_xy" in batch and "landmark_valid" in batch:
             logits, points, valid = outputs["landmark_heatmap"], batch["landmark_xy"], batch["landmark_valid"].bool()
             target = self._heatmap_target(points, valid, logits.shape[-2], logits.shape[-1])
-            heatmap_error = nn.functional.mse_loss(logits.sigmoid(), target, reduction="none").mean((-1, -2))
+            heatmap_error = nn.functional.binary_cross_entropy_with_logits(logits, target, reduction="none").mean((-1, -2))
             logvar = outputs.get("landmark_logvar", logits.new_zeros(logits.shape[:2])).clamp(-4.0, 4.0)
-            # Sparse pixel MSE alone admits the degenerate solution of pushing
-            # every heatmap logit negative.  Train the decoded coordinates
-            # directly as well, so a low loss means geometrically correct eyes.
-            decoded = outputs.get("landmark_xy", self._softargmax(logits))
+            decoded = self.decode_heatmap(logits)
             coordinate_error = nn.functional.smooth_l1_loss(decoded, points, reduction="none").mean(-1)
             losses["landmark"] = self._masked_mean(torch.exp(-logvar) * heatmap_error + logvar, valid)
-            losses["landmark_coord"] = 20.0 * self._masked_mean(coordinate_error, valid)
+            losses["landmark_coord"] = 10.0 * self._masked_mean(coordinate_error, valid)
             if self.shape_prior is not None:
                 losses["shape_prior"] = self.shape_prior(self._softargmax(logits), valid)
         if "pose_ypr" in batch and "pose_valid" in batch:
