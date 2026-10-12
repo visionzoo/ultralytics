@@ -201,6 +201,8 @@ def train_teacher(
     criterion = DMSROILoss()
     loaders = _roi_loaders(Path(manifest_dir), image_size, batch_size, "train", ("landmark", "pose"), workers)
     optimizer = torch.optim.AdamW(teacher.parameters(), lr=lr)
+    amp_enabled = device_obj.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     history = []
     log_path = output / "teacher_train.log"
     tasks = tuple(loaders)
@@ -212,10 +214,12 @@ def train_teacher(
             batch = _device_batch(next(loaders[task]), device_obj)
             batch["img"] = batch["img"].float() / 255
             optimizer.zero_grad(set_to_none=True)
-            outputs = teacher_parallel(make_teacher_crops(batch["img"], batch["face_rois"], crop_size))
-            loss, _ = criterion(outputs, batch)
-            loss.backward()
-            optimizer.step()
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
+                outputs = teacher_parallel(make_teacher_crops(batch["img"], batch["face_rois"], crop_size))
+                loss, _ = criterion(outputs, batch)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             totals[task] = totals.get(task, 0.0) + float(loss.detach())
             counts[task] = counts.get(task, 0) + 1
         epoch_metrics = {task: totals[task] / counts[task] for task in totals}
