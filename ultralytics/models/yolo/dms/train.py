@@ -306,12 +306,24 @@ def _evaluate_roi_epoch(
     """Evaluate one small deterministic test pass after each ROI epoch."""
     model.eval()
     results: dict[str, float] = {}
-    for task, loader in _roi_loaders(manifest_dir, image_size, batch_size, "test", workers=0).items():
-        batch = _device_batch(next(loader), device)
-        batch["img"] = batch["img"].float() / 255
-        _, items = model.loss(batch)
-        for name, value in items.items():
-            results[f"{task}/{name}"] = float(value)
+    sources = {"parts": "dsm.jsonl", "landmark": "eye12.jsonl", "pose": "pose.jsonl"}
+    for task, filename in sources.items():
+        path = manifest_dir / filename
+        if not path.is_file() or not path.stat().st_size:
+            continue
+        dataset = DMSROIDataset(path, task, image_size, "test")
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_roi, num_workers=0)
+        totals, count = {}, 0
+        for batch in loader:
+            batch = _device_batch(batch, device)
+            batch["img"] = batch["img"].float() / 255
+            _, items = model.loss(batch)
+            batch_count = len(dataset) if len(dataset) < batch_size else batch["img"].shape[0]
+            count += batch_count
+            for name, value in items.items():
+                totals[name] = totals.get(name, 0.0) + float(value) * batch_count
+        for name, value in totals.items():
+            results[f"{task}/{name}"] = value / max(count, 1)
     model.model.eval()
     model.dms_heads.train()
     return results
@@ -461,10 +473,16 @@ def evaluate_roi(
     device_obj, _ = _cuda_devices(device)
     model.to(device_obj).eval()
     results = {}
-    for task, loader in _roi_loaders(Path(manifest_dir), image_size, batch_size, "test").items():
+    sources = {"parts": "dsm.jsonl", "landmark": "eye12.jsonl", "pose": "pose.jsonl"}
+    for task, filename in sources.items():
+        path = Path(manifest_dir) / filename
+        if not path.is_file() or not path.stat().st_size:
+            continue
+        dataset = DMSROIDataset(path, task, image_size, "test")
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_roi, num_workers=0)
         losses = []
-        for _ in range(batches_per_task):
-            batch = _device_batch(next(loader), device_obj)
+        for batch in loader:
+            batch = _device_batch(batch, device_obj)
             batch["img"] = batch["img"].float() / 255
             loss, _ = model.loss(batch)
             losses.append(float(loss))
