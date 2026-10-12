@@ -11,10 +11,11 @@ from torch import nn
 class DMSROILoss(nn.Module):
     """Masked fixed-part, heatmap and pose losses for partially labelled batches."""
 
-    def __init__(self, heatmap_sigma: float = 1.5, shape_prior=None):
+    def __init__(self, heatmap_sigma: float = 1.5, shape_prior=None, pose_scale=(90.0, 45.0, 45.0)):
         super().__init__()
         self.heatmap_sigma = heatmap_sigma
         self.shape_prior = shape_prior
+        self.register_buffer("pose_scale", torch.tensor(pose_scale, dtype=torch.float32), persistent=True)
 
     @staticmethod
     def _zero(outputs: Mapping[str, torch.Tensor]) -> torch.Tensor:
@@ -84,7 +85,12 @@ class DMSROILoss(nn.Module):
                 losses["shape_prior"] = self.shape_prior(self._softargmax(logits), valid)
         if "pose_ypr" in batch and "pose_valid" in batch:
             valid = batch["pose_valid"].bool()
-            pose_error = nn.functional.smooth_l1_loss(outputs["pose_ypr"], batch["pose_ypr"], reduction="none").mean(-1)
+            # Keep the public model output in degrees, but normalize only the
+            # loss operands so yaw/pitch/roll contribute on comparable scales.
+            scale = self.pose_scale.to(device=outputs["pose_ypr"].device, dtype=outputs["pose_ypr"].dtype)
+            pred_norm = outputs["pose_ypr"] / scale
+            target_norm = batch["pose_ypr"].to(outputs["pose_ypr"].dtype) / scale
+            pose_error = nn.functional.smooth_l1_loss(pred_norm, target_norm, reduction="none").mean(-1)
             losses["pose"] = self._masked_mean(pose_error, valid)
 
         total = sum(losses.values(), zero)
