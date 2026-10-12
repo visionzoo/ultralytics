@@ -300,6 +300,7 @@ def train_roi(
     kd_feature_weight: float = 1.0,
     kd_heatmap_weight: float = 1.0,
     workers: int = 0,
+    amp: bool = True,
 ) -> Path:
     """Train heterogeneous ROI batches; global detector training stays with DetectionTrainer."""
     output = Path(output)
@@ -331,6 +332,8 @@ def train_roi(
         raise ValueError("all ROI task weights are zero")
     optimizer = torch.optim.AdamW((param for param in model.parameters() if param.requires_grad), lr=lr)
     roi_forward = _parallel(_ROIForward(model), device_ids)
+    amp_enabled = bool(amp and device_obj.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     history = []
     validation_history = []
     for epoch in range(epochs):
@@ -340,11 +343,15 @@ def train_roi(
             batch = _device_batch(next(loaders[task]), device_obj)
             batch["img"] = batch["img"].float() / 255
             optimizer.zero_grad(set_to_none=True)
-            loss, items = _student_roi_loss(
-                model, roi_forward, batch, teacher, teacher_crop_size, kd_feature_weight, kd_heatmap_weight
-            )
-            loss.backward()
-            optimizer.step()
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
+                loss, items = _student_roi_loss(
+                    model, roi_forward, batch, teacher, teacher_crop_size, kd_feature_weight, kd_heatmap_weight
+                )
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+            scaler.step(optimizer)
+            scaler.update()
             totals[task] = totals.get(task, 0.0) + float(loss.detach())
             counts[task] = counts.get(task, 0) + 1
         history.append({task: totals[task] / counts[task] for task in totals})
