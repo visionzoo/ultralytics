@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 from .model import DMSModel
-from .schema import LANDMARK_NAMES, PART_SLOTS
+from .schema import LANDMARK_NAMES, PART_SLOTS, ROI_INPUT_CONTRACT
 
 
 class EncoderExport(nn.Module):
@@ -95,6 +95,7 @@ def export_dms_onnx(
     )
     manifest = {
         "schema_version": 1,
+        "roi_input_contract": ROI_INPUT_CONTRACT,
         "image_size": image_size,
         "max_faces": max_faces,
         "roi_align": {"aligned": True, "b2_stride": 4, "p3_stride": 8, "b2_size": 32, "p3_size": 16},

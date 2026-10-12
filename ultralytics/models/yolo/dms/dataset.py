@@ -12,9 +12,9 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from dms.preprocess import canonical_face_crop
+from ultralytics.data.augment import LetterBox
 
-from .schema import PART_SLOTS, is_face_label
+from .schema import is_face_label
 
 
 def _box(values: list[float] | tuple[float, ...]) -> np.ndarray:
@@ -87,7 +87,17 @@ class DMSROIDataset(Dataset):
             points = raw_points @ inverse[:, :2].T + inverse[:, 2] - crop_box[:2]
             face = np.asarray([[0, 0, crop_w, crop_h]], dtype=np.float32)
         source_face = face[0].copy()
-        img, face = canonical_face_crop(image, face[0], self.image_size)
+        # Encode the available source image once, preserving its context and
+        # aspect ratio. Only features, not input pixels, are cropped for the
+        # student. Eye12/300W-LP remain crop-only sources when no full frame is
+        # available; DSM supplies whole-frame supervision.
+        transform = LetterBox(new_shape=(self.image_size, self.image_size), auto=False, stride=32)
+        params = transform.get_params({"img": image})
+        image = transform(image=image)
+        face = source_face * np.asarray(params["ratio"] * 2, dtype=np.float32) + np.asarray(
+            [params["left"], params["top"], params["left"], params["top"]], dtype=np.float32
+        )
+        img = torch.from_numpy(np.ascontiguousarray(image[..., ::-1].transpose(2, 0, 1)))
         result: dict[str, Any] = {
             "task": self.task,
             "img": img,

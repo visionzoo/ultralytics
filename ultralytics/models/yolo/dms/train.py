@@ -25,7 +25,7 @@ from ultralytics.utils import RANK
 from .model import DMSModel
 from .dataset import DMSROIDataset, collate_roi
 from .loss import DMSROILoss
-from .schema import LANDMARK_NAMES
+from .schema import LANDMARK_NAMES, ROI_INPUT_CONTRACT
 from .teacher import CropTeacher, distillation_loss, make_teacher_crops
 from dms.shape_bayes import ShapeBayesPrior
 
@@ -113,6 +113,13 @@ def load_dms_weights(model: DMSModel, weights: str | Path | None) -> DMSModel:
     checkpoint, _ = torch_safe_load(weights)
     stored = checkpoint.get("model") if isinstance(checkpoint, dict) else checkpoint
     if isinstance(stored, dict):
+        if any(key.startswith("dms_heads.") for key in stored):
+            contract = checkpoint.get("metadata", {}).get("roi_input_contract")
+            if contract != ROI_INPUT_CONTRACT:
+                raise ValueError(
+                    "DMS ROI checkpoint uses the old pixel-crop encoder contract. "
+                    "Reuse the global detector and retrain ROI heads with dms-roi-train before merging."
+                )
         model.load_state_dict(stored, strict=False)
     else:
         model.load(checkpoint)
@@ -372,6 +379,7 @@ def train_roi(
         )
         checkpoint = {
             "model": model.state_dict(),
+            "metadata": {"roi_input_contract": ROI_INPUT_CONTRACT},
             "epoch": epoch + 1,
             "history": history,
             "validation_history": validation_history,
