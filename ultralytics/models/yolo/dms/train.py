@@ -150,8 +150,8 @@ def _device_batch(batch: dict, device: torch.device) -> dict:
 @torch.inference_mode()
 def _teacher_pose_mae(teacher: torch.nn.Module, manifest_dir: Path, image_size: int,
                       crop_size: int, batch_size: int, device: torch.device,
-                      split: str = "val") -> float:
-    """Evaluate teacher pose MAE on a finite split without updating weights."""
+                      split: str = "val") -> tuple[float, float, float]:
+    """Evaluate per-axis teacher pose MAE on a finite split."""
     dataset = DMSROIDataset(manifest_dir / "pose.jsonl", "pose", image_size, split)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0,
                         pin_memory=device.type == "cuda", collate_fn=collate_roi)
@@ -166,7 +166,7 @@ def _teacher_pose_mae(teacher: torch.nn.Module, manifest_dir: Path, image_size: 
         count += int(prediction.shape[0])
     if was_training:
         teacher.train()
-    return float((error.sum() / max(count * 3, 1)).item())
+    return tuple(float(value) for value in (error / max(count, 1)).cpu())
 
 
 def load_dms_weights(model: DMSModel, weights: str | Path | None) -> DMSModel:
@@ -296,7 +296,11 @@ def train_teacher(
         teacher.load_state_dict(stored, strict=False)
         if isinstance(checkpoint, dict):
             resume_epoch = int(checkpoint.get("epoch", 0))
-            resumed_best_mae = float(checkpoint.get("metadata", {}).get("best_pose_val_mae_deg", float("inf")))
+            metadata = checkpoint.get("metadata", {})
+            resumed_best_mae = float(metadata.get(
+                "best_pose_val_yaw_mae_deg",
+                metadata.get("best_pose_val_mae_deg", float("inf")),
+            ))
     teacher = teacher.to(device_obj).train()
     teacher_parallel = _parallel(teacher, device_ids)
     criterion = DMSROILoss()
@@ -327,19 +331,27 @@ def train_teacher(
             totals[task] = totals.get(task, 0.0) + float(loss.detach())
             counts[task] = counts.get(task, 0) + 1
         epoch_metrics = {task: totals[task] / counts[task] for task in totals}
-        pose_val_mae = _teacher_pose_mae(
+        pose_val_axes = _teacher_pose_mae(
             teacher_parallel, Path(manifest_dir), image_size, crop_size, batch_size, device_obj
         )
-        epoch_metrics["pose_val_mae_deg"] = pose_val_mae
+        pose_val_yaw, pose_val_pitch, pose_val_roll = pose_val_axes
+        pose_val_mae = sum(pose_val_axes) / 3.0
+        epoch_metrics.update({
+            "pose_val_yaw_mae_deg": pose_val_yaw,
+            "pose_val_pitch_mae_deg": pose_val_pitch,
+            "pose_val_roll_mae_deg": pose_val_roll,
+            "pose_val_mae_deg": pose_val_mae,
+        })
         display_epoch = resume_epoch + epoch + 1
-        if pose_val_mae < best_pose_mae - pose_min_delta:
-            best_pose_mae, stale_epochs = pose_val_mae, 0
+        # Yaw is the primary pose objective; mean MAE is retained as context.
+        if pose_val_yaw < best_pose_mae - pose_min_delta:
+            best_pose_mae, stale_epochs = pose_val_yaw, 0
             best_state = copy.deepcopy(teacher.state_dict())
             torch.save(
                 {
                     "model": best_state,
                     "epoch": display_epoch,
-                    "metadata": {"best_pose_val_mae_deg": best_pose_mae},
+                    "metadata": {"best_pose_val_yaw_mae_deg": best_pose_mae},
                 },
                 output / "teacher_best.pt",
             )
@@ -363,18 +375,19 @@ def train_teacher(
                     "crop_size": crop_size,
                     "landmark_names": LANDMARK_NAMES,
                     "pose_order": "yaw_pitch_roll_deg",
-                    "best_pose_val_mae_deg": best_pose_mae,
+                    "best_pose_val_yaw_mae_deg": best_pose_mae,
                 },
             },
             output / "teacher.pt",
         )
-        reached_target = target_pose_mae is not None and pose_val_mae <= target_pose_mae
+        reached_target = target_pose_mae is not None and pose_val_yaw <= target_pose_mae
         reached_patience = pose_patience > 0 and stale_epochs >= pose_patience
         if reached_target or reached_patience:
             reason = "target" if reached_target else "patience"
             stop_message = (
                 f"{datetime.now().isoformat(timespec='seconds')} early_stop={reason} "
-                f"pose_val_mae_deg={pose_val_mae:.6f} best={best_pose_mae:.6f}"
+                f"pose_val_yaw_mae_deg={pose_val_yaw:.6f} "
+                f"pose_val_mae_deg={pose_val_mae:.6f} best_yaw={best_pose_mae:.6f}"
             )
             print(stop_message, flush=True)
             with log_path.open("a", encoding="utf-8") as handle:
@@ -671,7 +684,8 @@ def main() -> None:
     parser.add_argument("--resume-teacher", type=Path,
                         help="continue teacher training from an existing teacher.pt")
     parser.add_argument("--teacher-crop-size", type=int, default=128)
-    parser.add_argument("--target-pose-mae", type=float)
+    parser.add_argument("--target-pose-mae", type=float,
+                        help="stop when validation yaw MAE reaches this degree threshold")
     parser.add_argument("--pose-patience", type=int, default=0,
                         help="stop after this many validation epochs without improvement; 0 disables")
     parser.add_argument("--pose-min-delta", type=float, default=0.1)
