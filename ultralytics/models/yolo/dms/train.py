@@ -146,6 +146,28 @@ def _device_batch(batch: dict, device: torch.device) -> dict:
     return {key: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value for key, value in batch.items()}
 
 
+@torch.inference_mode()
+def _teacher_pose_mae(teacher: torch.nn.Module, manifest_dir: Path, image_size: int,
+                      crop_size: int, batch_size: int, device: torch.device,
+                      split: str = "val") -> float:
+    """Evaluate teacher pose MAE on a finite split without updating weights."""
+    dataset = DMSROIDataset(manifest_dir / "pose.jsonl", "pose", image_size, split)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0,
+                        pin_memory=device.type == "cuda", collate_fn=collate_roi)
+    was_training = teacher.training
+    teacher.eval()
+    error, count = torch.zeros(3, device=device), 0
+    for batch in loader:
+        batch = _device_batch(batch, device)
+        image = batch["img"].float() / 255.0
+        prediction = teacher(make_teacher_crops(image, batch["face_rois"], crop_size))["pose_ypr"]
+        error += (prediction - batch["pose_ypr"].float()).abs().sum(dim=0)
+        count += int(prediction.shape[0])
+    if was_training:
+        teacher.train()
+    return float((error.sum() / max(count * 3, 1)).item())
+
+
 def load_dms_weights(model: DMSModel, weights: str | Path | None) -> DMSModel:
     """Load either a native Ultralytics checkpoint or a DMS ROI state-dict checkpoint."""
     if not weights:
@@ -249,6 +271,9 @@ def train_teacher(
     device: str = "cpu",
     workers: int = 0,
     tb_log_dir: str | Path | None = None,
+    target_pose_mae: float | None = None,
+    pose_patience: int = 0,
+    pose_min_delta: float = 0.1,
 ) -> Path:
     """Train the RGB crop teacher on only landmark and pose train samples."""
     output = Path(output)
@@ -267,6 +292,8 @@ def train_teacher(
     amp_enabled = device_obj.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     history = []
+    best_pose_mae = float("inf")
+    stale_epochs = 0
     writer = _tensorboard_writer(tb_log_dir)
     log_path = output / "teacher_train.log"
     tasks = tuple(loaders)
@@ -287,6 +314,14 @@ def train_teacher(
             totals[task] = totals.get(task, 0.0) + float(loss.detach())
             counts[task] = counts.get(task, 0) + 1
         epoch_metrics = {task: totals[task] / counts[task] for task in totals}
+        pose_val_mae = _teacher_pose_mae(
+            teacher_parallel, Path(manifest_dir), image_size, crop_size, batch_size, device_obj
+        )
+        epoch_metrics["pose_val_mae_deg"] = pose_val_mae
+        if pose_val_mae < best_pose_mae - pose_min_delta:
+            best_pose_mae, stale_epochs = pose_val_mae, 0
+        else:
+            stale_epochs += 1
         history.append(epoch_metrics)
         if writer:
             for task, value in epoch_metrics.items():
@@ -305,10 +340,23 @@ def train_teacher(
                     "crop_size": crop_size,
                     "landmark_names": LANDMARK_NAMES,
                     "pose_order": "yaw_pitch_roll_deg",
+                    "best_pose_val_mae_deg": best_pose_mae,
                 },
             },
             output / "teacher.pt",
         )
+        reached_target = target_pose_mae is not None and pose_val_mae <= target_pose_mae
+        reached_patience = pose_patience > 0 and stale_epochs >= pose_patience
+        if reached_target or reached_patience:
+            reason = "target" if reached_target else "patience"
+            stop_message = (
+                f"{datetime.now().isoformat(timespec='seconds')} early_stop={reason} "
+                f"pose_val_mae_deg={pose_val_mae:.6f} best={best_pose_mae:.6f}"
+            )
+            print(stop_message, flush=True)
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(stop_message + "\n")
+            break
     _write_teacher_artifacts(output, history)
     return output / "teacher.pt"
 
@@ -582,6 +630,10 @@ def main() -> None:
     parser.add_argument("--train-teacher", action="store_true")
     parser.add_argument("--teacher-weights", type=Path)
     parser.add_argument("--teacher-crop-size", type=int, default=128)
+    parser.add_argument("--target-pose-mae", type=float)
+    parser.add_argument("--pose-patience", type=int, default=0,
+                        help="stop after this many validation epochs without improvement; 0 disables")
+    parser.add_argument("--pose-min-delta", type=float, default=0.1)
     parser.add_argument("--kd-feature-weight", type=float, default=1.0)
     parser.add_argument("--kd-heatmap-weight", type=float, default=1.0)
     args = parser.parse_args()
@@ -599,6 +651,9 @@ def main() -> None:
                 workers=args.workers,
                 lr=args.lr,
                 tb_log_dir=args.tb_log_dir,
+                target_pose_mae=args.target_pose_mae,
+                pose_patience=args.pose_patience,
+                pose_min_delta=args.pose_min_delta,
             )
         )
         return
