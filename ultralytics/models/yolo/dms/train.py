@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import multiprocessing as mp
@@ -304,6 +305,7 @@ def train_teacher(
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     history = []
     best_pose_mae = resumed_best_mae
+    best_state = copy.deepcopy(teacher.state_dict()) if resume_checkpoint else None
     stale_epochs = 0
     writer = _tensorboard_writer(tb_log_dir)
     log_path = output / "teacher_train.log"
@@ -329,15 +331,24 @@ def train_teacher(
             teacher_parallel, Path(manifest_dir), image_size, crop_size, batch_size, device_obj
         )
         epoch_metrics["pose_val_mae_deg"] = pose_val_mae
+        display_epoch = resume_epoch + epoch + 1
         if pose_val_mae < best_pose_mae - pose_min_delta:
             best_pose_mae, stale_epochs = pose_val_mae, 0
+            best_state = copy.deepcopy(teacher.state_dict())
+            torch.save(
+                {
+                    "model": best_state,
+                    "epoch": display_epoch,
+                    "metadata": {"best_pose_val_mae_deg": best_pose_mae},
+                },
+                output / "teacher_best.pt",
+            )
         else:
             stale_epochs += 1
         history.append(epoch_metrics)
         if writer:
             for task, value in epoch_metrics.items():
                 writer.add_scalar(f"teacher/{task}_loss", value, epoch + 1)
-        display_epoch = resume_epoch + epoch + 1
         message = f"{datetime.now().isoformat(timespec='seconds')} epoch={display_epoch}/{resume_epoch + epochs} " + " ".join(f"{task}_loss={value:.6f}" for task, value in sorted(epoch_metrics.items()))
         print(message, flush=True)
         with log_path.open("a", encoding="utf-8") as handle:
@@ -369,6 +380,22 @@ def train_teacher(
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(stop_message + "\n")
             break
+    if best_state is not None:
+        teacher.load_state_dict(best_state, strict=False)
+        torch.save(
+            {
+                "model": teacher.state_dict(),
+                "epoch": resume_epoch + len(history),
+                "history": history,
+                "metadata": {
+                    "crop_size": crop_size,
+                    "landmark_names": LANDMARK_NAMES,
+                    "pose_order": "yaw_pitch_roll_deg",
+                    "best_pose_val_mae_deg": best_pose_mae,
+                },
+            },
+            output / "teacher.pt",
+        )
     _write_teacher_artifacts(output, history)
     return output / "teacher.pt"
 
