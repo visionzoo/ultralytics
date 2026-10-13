@@ -122,7 +122,13 @@ class DMSROILoss(nn.Module):
             center = self.pose_center.to(device=outputs["pose_ypr"].device, dtype=outputs["pose_ypr"].dtype)
             pred_norm = (outputs["pose_ypr"] - center) / scale
             target_norm = (batch["pose_ypr"].to(outputs["pose_ypr"].dtype) - center) / scale
-            pose_error = nn.functional.smooth_l1_loss(pred_norm, target_norm, reduction="none").mean(-1)
+            # The public head remains in degrees. After normalization, yaw's
+            # raw gradient is smaller because its natural range is wider;
+            # compensate explicitly so yaw does not underfit while pitch and
+            # roll converge.
+            angle_weight = pred_norm.new_tensor((3.0, 1.0, 1.0))
+            pose_error = nn.functional.smooth_l1_loss(pred_norm, target_norm, reduction="none")
+            pose_error = (pose_error * angle_weight).mean(-1)
             losses["pose"] = self._masked_mean(pose_error, valid)
             losses["pose_mae_deg"] = self._masked_mean(
                 (outputs["pose_ypr"] - batch["pose_ypr"].to(outputs["pose_ypr"].dtype)).abs().mean(-1), valid
