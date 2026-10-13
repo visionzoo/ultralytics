@@ -11,11 +11,21 @@ from torch import nn
 class DMSROILoss(nn.Module):
     """Masked fixed-part, heatmap and pose losses for partially labelled batches."""
 
-    def __init__(self, heatmap_sigma: float = 1.5, shape_prior=None, pose_scale=(90.0, 45.0, 45.0)):
+    def __init__(self, heatmap_sigma: float = 1.5, shape_prior=None, pose_scale=(55.0, 12.0, 11.0), pose_center=(0.0, 0.0, 0.0)):
         super().__init__()
         self.heatmap_sigma = heatmap_sigma
         self.shape_prior = shape_prior
         self.register_buffer("pose_scale", torch.tensor(pose_scale, dtype=torch.float32), persistent=True)
+        self.register_buffer("pose_center", torch.tensor(pose_center, dtype=torch.float32), persistent=True)
+
+    def set_pose_stats(self, center, scale) -> None:
+        """Set train-split pose mean/std while keeping public outputs in degrees."""
+        center = torch.as_tensor(center, dtype=self.pose_center.dtype, device=self.pose_center.device)
+        scale = torch.as_tensor(scale, dtype=self.pose_scale.dtype, device=self.pose_scale.device).clamp_min(1.0)
+        if center.numel() != 3 or scale.numel() != 3:
+            raise ValueError("pose center and scale must each contain yaw, pitch, roll")
+        self.pose_center.copy_(center.reshape(3))
+        self.pose_scale.copy_(scale.reshape(3))
 
     @staticmethod
     def _zero(outputs: Mapping[str, torch.Tensor]) -> torch.Tensor:
@@ -91,10 +101,17 @@ class DMSROILoss(nn.Module):
             target = self._heatmap_target(points, valid, logits.shape[-2], logits.shape[-1])
             heatmap_error = nn.functional.binary_cross_entropy_with_logits(logits, target, reduction="none").mean((-1, -2))
             logvar = outputs.get("landmark_logvar", logits.new_zeros(logits.shape[:2])).clamp(-4.0, 4.0)
-            decoded = self.decode_heatmap(logits)
+            # Use a differentiable full-map soft-argmax for training. The local
+            # peak decoder intentionally uses argmax and is therefore not a
+            # valid source of coordinate gradients; using it here makes all
+            # landmarks collapse to one fixed peak.
+            decoded = self._softargmax(logits)
             coordinate_error = nn.functional.smooth_l1_loss(decoded, points, reduction="none").mean(-1)
             losses["landmark"] = self._masked_mean(torch.exp(-logvar) * heatmap_error + logvar, valid)
             losses["landmark_coord"] = 10.0 * self._masked_mean(coordinate_error, valid)
+            # Reporting metric: mean normalized Euclidean error, excluded
+            # from the optimized total below.
+            losses["landmark_nme"] = self._masked_mean(torch.linalg.vector_norm(decoded - points, dim=-1), valid).detach()
             if self.shape_prior is not None:
                 losses["shape_prior"] = self.shape_prior(self._softargmax(logits), valid)
         if "pose_ypr" in batch and "pose_valid" in batch:
@@ -102,10 +119,19 @@ class DMSROILoss(nn.Module):
             # Keep the public model output in degrees, but normalize only the
             # loss operands so yaw/pitch/roll contribute on comparable scales.
             scale = self.pose_scale.to(device=outputs["pose_ypr"].device, dtype=outputs["pose_ypr"].dtype)
-            pred_norm = outputs["pose_ypr"] / scale
-            target_norm = batch["pose_ypr"].to(outputs["pose_ypr"].dtype) / scale
+            center = self.pose_center.to(device=outputs["pose_ypr"].device, dtype=outputs["pose_ypr"].dtype)
+            pred_norm = (outputs["pose_ypr"] - center) / scale
+            target_norm = (batch["pose_ypr"].to(outputs["pose_ypr"].dtype) - center) / scale
             pose_error = nn.functional.smooth_l1_loss(pred_norm, target_norm, reduction="none").mean(-1)
             losses["pose"] = self._masked_mean(pose_error, valid)
+            losses["pose_mae_deg"] = self._masked_mean(
+                (outputs["pose_ypr"] - batch["pose_ypr"].to(outputs["pose_ypr"].dtype)).abs().mean(-1), valid
+            ).detach()
+            per_angle = (outputs["pose_ypr"] - batch["pose_ypr"].to(outputs["pose_ypr"].dtype)).abs()
+            for index, name in enumerate(("yaw", "pitch", "roll")):
+                losses[f"pose_mae_{name}_deg"] = self._masked_mean(per_angle[:, index], valid).detach()
 
-        total = sum(losses.values(), zero)
+        # Metrics above are detached and must not contribute to optimization.
+        metric_names = {"landmark_nme", "pose_mae_deg"}
+        total = sum((value for name, value in losses.items() if name not in metric_names), zero)
         return total, losses

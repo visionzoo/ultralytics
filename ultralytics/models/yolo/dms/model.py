@@ -31,6 +31,14 @@ class DMSModel(DetectionModel):
         self.feature_strides = tuple(int(value) for value in dms_cfg.get("feature_strides", (4, 8)))
         if len(self.feature_strides) != 2 or len(set(self.feature_strides)) != 2:
             raise ValueError("dms.feature_strides must contain exactly two distinct strides")
+        configured_layers = dms_cfg.get("feature_layers")
+        if configured_layers is None:
+            # YOLO26n's first P2/4 backbone output and the final P3/8 neck
+            # output. Custom backbones must declare their own taps explicitly.
+            configured_layers = (1, 16)
+        self.feature_layers = tuple(int(value) for value in configured_layers)
+        if len(self.feature_layers) != 2 or len(set(self.feature_layers)) != 2:
+            raise ValueError("dms.feature_layers must contain exactly two distinct layer indices")
         self.roi_head_name = str(dms_cfg.get("roi_head", "default"))
         self.roi_head_kwargs = dict(dms_cfg.get("roi_kwargs", {}))
         self.dms_heads = build_roi_head(self.roi_head_name, **self.roi_head_kwargs)
@@ -38,6 +46,7 @@ class DMSModel(DetectionModel):
             "roi_head": self.roi_head_name,
             "roi_kwargs": self.roi_head_kwargs,
             "feature_strides": list(self.feature_strides),
+            "feature_layers": list(self.feature_layers),
             "landmark_decoder": "heatmap_local_softargmax_v2",
         }
         self.dms_criterion = DMSROILoss()
@@ -52,20 +61,27 @@ class DMSModel(DetectionModel):
     def forward_encoder(self, image: torch.Tensor) -> EncoderOutput:
         """Execute the normal YOLO graph once and retain configured feature maps."""
         saved, x, features = [], image, {}
-        for layer in self.model:
+        taps = set(self.feature_layers)
+        for index, layer in enumerate(self.model):
             if layer.f != -1:
                 x = saved[layer.f] if isinstance(layer.f, int) else [x if item == -1 else saved[item] for item in layer.f]
             x = layer(x)
             saved.append(x)
-            if isinstance(x, torch.Tensor):
+            if index in taps:
+                if not isinstance(x, torch.Tensor):
+                    raise RuntimeError(f"configured DMS feature layer {index} did not return a tensor")
                 stride = self._stride_for(image, x)
-                if stride in self.feature_strides:
-                    features[stride] = x
-        missing = [stride for stride in self.feature_strides if stride not in features]
+                expected = self.feature_strides[len(features)]
+                if stride != expected:
+                    raise RuntimeError(
+                        f"configured DMS feature layer {index} has stride {stride}, expected {expected}"
+                    )
+                features[index] = x
+        missing = [layer for layer in self.feature_layers if layer not in features]
         if missing:
-            raise RuntimeError(f"YOLO graph did not expose configured feature strides: {missing}")
-        first, second = self.feature_strides
-        return EncoderOutput(x, features[first], features[second], first, second)
+            raise RuntimeError(f"YOLO graph did not expose configured feature layers: {missing}")
+        first, second = self.feature_layers
+        return EncoderOutput(x, features[first], features[second], self.feature_strides[0], self.feature_strides[1])
 
     def forward_roi(
         self, b2_rois: torch.Tensor, p3_rois: torch.Tensor, roi_valid: torch.Tensor | None = None

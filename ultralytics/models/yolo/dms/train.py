@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import multiprocessing as mp
 import random
 import sys
 from datetime import datetime
@@ -16,7 +17,7 @@ if str(_RESEARCH_ROOT) not in sys.path:
     sys.path.insert(0, str(_RESEARCH_ROOT))
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.nn.tasks import torch_safe_load
@@ -93,7 +94,7 @@ class _ROIForward(torch.nn.Module):
 
 def _roi_loaders(
     manifest_dir: Path, image_size: int, batch_size: int, split: str, tasks: tuple[str, ...] | None = None,
-    workers: int = 0,
+    workers: int = 0, pin_memory: bool = False,
 ) -> dict[str, Iterator[dict]]:
     sources = {"parts": "dsm.jsonl", "landmark": "eye12.jsonl", "pose": "pose.jsonl"}
     loaders = {}
@@ -102,14 +103,43 @@ def _roi_loaders(
         path = manifest_dir / filename
         if path.is_file() and path.stat().st_size:
             dataset = DMSROIDataset(path, task, image_size, split)
-            loaders[task] = _cycle(DataLoader(
-                dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_roi,
-                num_workers=workers, pin_memory=torch.cuda.is_available(),
-                persistent_workers=workers > 0,
-            ))
+            loader_kwargs = {
+                "batch_size": batch_size,
+                "collate_fn": collate_roi,
+                "num_workers": workers,
+                "pin_memory": pin_memory,
+                "persistent_workers": workers > 0,
+            }
+            if task == "pose" and split == "train":
+                loader_kwargs["sampler"] = WeightedRandomSampler(
+                    dataset.pose_sampling_weights(), num_samples=len(dataset), replacement=True
+                )
+            else:
+                loader_kwargs["shuffle"] = True
+            # Never fork a worker after CUDA has been initialized.  Spawned
+            # workers are independent CPU readers and cannot inherit CUDA locks.
+            if workers > 0:
+                loader_kwargs["multiprocessing_context"] = mp.get_context("spawn")
+            loaders[task] = _cycle(DataLoader(dataset, **loader_kwargs))
     if not loaders:
         raise ValueError(f"no usable ROI manifests in {manifest_dir}")
     return loaders
+
+
+def _pose_train_stats(manifest_dir: Path) -> tuple[list[float], list[float]]:
+    """Read train-split 300W-LP statistics without loading images."""
+    values = []
+    path = manifest_dir / "pose.jsonl"
+    if path.is_file():
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                row = json.loads(line)
+                if row.get("split") == "train" and row.get("pose_ypr_deg"):
+                    values.append(row["pose_ypr_deg"])
+    if not values:
+        return [0.0, 0.0, 0.0], [55.0, 12.0, 11.0]
+    tensor = torch.tensor(values, dtype=torch.float32)
+    return tensor.mean(0).tolist(), tensor.std(0, unbiased=False).clamp_min(1.0).tolist()
 
 
 def _device_batch(batch: dict, device: torch.device) -> dict:
@@ -149,7 +179,10 @@ def load_teacher_weights(teacher: CropTeacher, weights: str | Path) -> CropTeach
     stored = checkpoint.get("model") if isinstance(checkpoint, dict) else checkpoint
     if not isinstance(stored, dict):
         raise TypeError(f"teacher checkpoint has no state_dict: {weights}")
-    teacher.load_state_dict(stored)
+    # The ROI normalization change replaces shared DWBlock BatchNorm with
+    # GroupNorm.  Existing teacher checkpoints contain only obsolete BN
+    # running-stat keys; affine weights remain compatible.
+    teacher.load_state_dict(stored, strict=False)
     return teacher.freeze()
 
 
@@ -220,11 +253,16 @@ def train_teacher(
     """Train the RGB crop teacher on only landmark and pose train samples."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
+    # Construct CPU readers before touching CUDA.  Worker processes are
+    # spawned explicitly below, so they never inherit a CUDA runtime state.
+    loaders = _roi_loaders(
+        Path(manifest_dir), image_size, batch_size, "train", ("landmark", "pose"), workers,
+        pin_memory=False,
+    )
     device_obj, device_ids = _cuda_devices(device)
     teacher = CropTeacher().to(device_obj).train()
     teacher_parallel = _parallel(teacher, device_ids)
     criterion = DMSROILoss()
-    loaders = _roi_loaders(Path(manifest_dir), image_size, batch_size, "train", ("landmark", "pose"), workers)
     optimizer = torch.optim.AdamW(teacher.parameters(), lr=lr)
     amp_enabled = device_obj.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
@@ -347,17 +385,35 @@ def train_roi(
     workers: int = 0,
     amp: bool = True,
     tb_log_dir: str | Path | None = None,
+    unfreeze_layers: tuple[int, ...] = (),
+    backbone_lr: float = 1e-5,
+    pose_weight: float = 3.0,
+    landmark_weight: float = 2.0,
+    parts_weight: float = 1.0,
 ) -> Path:
     """Train heterogeneous ROI batches; global detector training stays with DetectionTrainer."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
+    # Build all CPU-side readers before model.to(cuda).  This ordering is
+    # required when the dataset lives on a shared filesystem.
+    loaders = _roi_loaders(Path(manifest_dir), image_size, batch_size, "train", workers=workers, pin_memory=False)
     device_obj, device_ids = _cuda_devices(device)
+    # A partially unfrozen backbone is not safe with the compact single-
+    # process DataParallel adapter: replicas can race on mutable BN/state.
+    # Keep this path single-GPU; the fully frozen-head path may still use DP.
+    if unfreeze_layers and len(device_ids) > 1:
+        device_ids = device_ids[:1]
     model.to(device_obj).train()
     # ROI fine-tuning must not move the global detector/backbone.  The deploy
     # checkpoint intentionally takes those weights from global best.pt.
     model.model.eval()
     for parameter in model.model.parameters():
         parameter.requires_grad_(False)
+    for index in unfreeze_layers:
+        if index < 0 or index >= len(model.model):
+            raise ValueError(f"DMS unfreeze layer out of range: {index}")
+        for parameter in model.model[index].parameters():
+            parameter.requires_grad_(True)
     # Materialize LazyConv2d before constructing the optimizer/DataParallel.
     with torch.no_grad():
         dummy = torch.zeros(1, 3, image_size, image_size, device=device_obj)
@@ -369,14 +425,23 @@ def train_roi(
     shape_prior = ShapeBayesPrior.from_json(Path(manifest_dir) / "shape_prior.json")
     if shape_prior is not None:
         model.dms_criterion.shape_prior = shape_prior.to(device_obj)
+    pose_center, pose_scale = _pose_train_stats(Path(manifest_dir))
+    model.dms_criterion.set_pose_stats(pose_center, pose_scale)
     if teacher is not None:
         teacher.to(device_obj).freeze()
-    loaders = _roi_loaders(Path(manifest_dir), image_size, batch_size, "train", workers=workers)
-    task_weights = task_weights or {task: 1.0 for task in loaders}
+    task_weights = task_weights or {
+        "parts": parts_weight,
+        "landmark": landmark_weight,
+        "pose": pose_weight,
+    }
     tasks = [task for task in loaders if task_weights.get(task, 0) > 0]
     if not tasks:
         raise ValueError("all ROI task weights are zero")
-    optimizer = torch.optim.AdamW((param for param in model.parameters() if param.requires_grad), lr=lr)
+    backbone_params = [p for p in model.model.parameters() if p.requires_grad]
+    head_params = [p for p in model.dms_heads.parameters() if p.requires_grad]
+    groups = ([{"params": backbone_params, "lr": backbone_lr}] if backbone_params else [])
+    groups.append({"params": head_params, "lr": lr})
+    optimizer = torch.optim.AdamW(groups)
     roi_forward = _parallel(_ROIForward(model), device_ids)
     amp_enabled = bool(amp and device_obj.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
@@ -418,11 +483,15 @@ def train_roi(
         (output / "roi_validation_metrics.json").write_text(
             json.dumps(validation_history, indent=2) + "\n", encoding="utf-8"
         )
+        # Backbone adaptation is kept in the ROI checkpoint for analysis, but
+        # is not deploy-merged unless global Detect is jointly fine-tuned.
+        merge_prefixes = ["dms_heads.", "dms_adapter.", "dms_criterion."]
         checkpoint = {
             "model": model.state_dict(),
             "metadata": {
                 "roi_input_contract": ROI_INPUT_CONTRACT,
                 "dms_architecture": model.dms_architecture,
+                "merge_prefixes": merge_prefixes,
             },
             "epoch": epoch + 1,
             "history": history,
@@ -503,6 +572,11 @@ def main() -> None:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--backbone-lr", type=float, default=1e-5)
+    parser.add_argument("--pose-weight", type=float, default=3.0)
+    parser.add_argument("--landmark-weight", type=float, default=2.0)
+    parser.add_argument("--parts-weight", type=float, default=1.0)
+    parser.add_argument("--unfreeze-layers", default="", help="comma-separated YOLO layer indices")
     parser.add_argument("--tb-log-dir")
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--train-teacher", action="store_true")
@@ -553,6 +627,11 @@ def main() -> None:
                 workers=args.workers,
                 lr=args.lr,
                 tb_log_dir=args.tb_log_dir,
+                unfreeze_layers=tuple(int(item) for item in args.unfreeze_layers.split(",") if item.strip()),
+                backbone_lr=args.backbone_lr,
+                pose_weight=args.pose_weight,
+                landmark_weight=args.landmark_weight,
+                parts_weight=args.parts_weight,
             )
         )
 

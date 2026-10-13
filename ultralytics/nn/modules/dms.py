@@ -41,12 +41,17 @@ class DWBlock(nn.Module):
 
     def __init__(self, channels: int, stride: int = 1):
         super().__init__()
+        # ROI batches alternate between DSM parts, Eye12 landmarks and
+        # 300W-LP pose.  BatchNorm running statistics therefore mix three
+        # unrelated image/task distributions and make eval-time outputs
+        # collapse. GroupNorm keeps train/eval behavior identical.
+        groups = 8 if channels % 8 == 0 else 1
         self.block = nn.Sequential(
             nn.Conv2d(channels, channels, 3, stride, 1, groups=channels, bias=False),
-            nn.BatchNorm2d(channels),
+            nn.GroupNorm(groups, channels),
             nn.SiLU(),
             nn.Conv2d(channels, channels, 1, bias=False),
-            nn.BatchNorm2d(channels),
+            nn.GroupNorm(groups, channels),
             nn.SiLU(),
         )
 
@@ -77,7 +82,7 @@ class DMSROIHeads(nn.Module):
         self.channels, self.eye_states, self.mouth_states = channels, eye_states, mouth_states
         self.fuse = nn.Sequential(
             nn.LazyConv2d(channels, 1, bias=False),
-            nn.BatchNorm2d(channels),
+            nn.GroupNorm(8 if channels % 8 == 0 else 1, channels),
             nn.SiLU(),
             DWBlock(channels),
             DWBlock(channels),
@@ -89,6 +94,8 @@ class DMSROIHeads(nn.Module):
             nn.ConvTranspose2d(channels, channels // 2, 2, 2), nn.SiLU(), nn.Conv2d(channels // 2, 12, 1)
         )
         self.landmark_logvar = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, 12))
+        # Keep the checkpoint-compatible pose head compact; pose improvement
+        # is driven by target normalization and balanced sampling below.
         self.pose = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, 64), nn.SiLU(), nn.Linear(64, 3))
 
     def forward(

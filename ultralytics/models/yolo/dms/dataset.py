@@ -58,6 +58,25 @@ class DMSROIDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def pose_sampling_weights(self) -> torch.Tensor:
+        """Inverse-frequency weights over yaw/pitch/roll bins for 300W-LP."""
+        if self.task != "pose" or not self.samples:
+            raise ValueError("pose_sampling_weights is only valid for pose datasets")
+        values = np.asarray([sample["pose_ypr_deg"] for sample in self.samples], dtype=np.float32)
+        weights = np.ones(len(values), dtype=np.float64)
+        bin_edges = (
+            np.asarray([-90, -60, -30, 0, 30, 60, 90], dtype=np.float32),
+            np.asarray([-60, -40, -20, 0, 20, 40, 60], dtype=np.float32),
+            np.asarray([-60, -40, -20, 0, 20, 40, 60], dtype=np.float32),
+        )
+        for axis in range(3):
+            edges = bin_edges[axis]
+            bins = np.searchsorted(edges[1:-1], values[:, axis], side="right")
+            counts = np.bincount(bins, minlength=6).astype(np.float64)
+            weights *= np.sqrt(counts.mean() / np.maximum(counts[bins], 1.0))
+        weights = np.clip(weights, 0.25, 4.0)
+        return torch.from_numpy(weights / weights.mean())
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample = self.samples[index]
         image = cv2.imread(sample["image"])
@@ -65,27 +84,15 @@ class DMSROIDataset(Dataset):
             raise FileNotFoundError(sample["image"])
         face = _box(sample["face_box_xyxy"]).reshape(1, 4)
         points = None
-        if self.task == "landmark" and sample.get("alignment_matrix") and sample.get("crop_box_xyxy"):
-            # Eye12 stores an aligned 128px crop.  Undo its recorded affine
-            # alignment so training sees the same face-box geometry as deploy.
-            crop_box = _box(sample["crop_box_xyxy"])
-            crop_w = max(1, int(round(crop_box[2] - crop_box[0])))
-            crop_h = max(1, int(round(crop_box[3] - crop_box[1])))
-            matrix = np.asarray(sample["alignment_matrix"], dtype=np.float32)
-            image = cv2.warpAffine(
-                image,
-                matrix,
-                (crop_w, crop_h),
-                flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-                borderMode=cv2.BORDER_REFLECT_101,
-            )
-            inverse = cv2.invertAffineTransform(matrix)
-            raw_points = np.asarray(sample["points"], dtype=np.float32)
-            # Eye12 stores points in the aligned 128px image frame. Map them
-            # back to the original image frame, then make them local to the
-            # reconstructed source crop used by the ROI trainer.
-            points = raw_points @ inverse[:, :2].T + inverse[:, 2] - crop_box[:2]
-            face = np.asarray([[0, 0, crop_w, crop_h]], dtype=np.float32)
+        if self.task == "landmark":
+            # Eye12's ``image`` is already the canonical aligned crop (the
+            # generated files are 128x128).  ``crop_box_xyxy`` and
+            # ``alignment_matrix`` describe where that crop came from in the
+            # original source image; applying them again to this image would
+            # crop outside its bounds and corrupt the landmark geometry.
+            height, width = image.shape[:2]
+            points = np.asarray(sample["points"], dtype=np.float32)
+            face = np.asarray([[0, 0, width, height]], dtype=np.float32)
         source_face = face[0].copy()
         # Encode the available source image once, preserving its context and
         # aspect ratio. Only features, not input pixels, are cropped for the

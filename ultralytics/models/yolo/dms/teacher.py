@@ -7,7 +7,22 @@ from collections.abc import Mapping
 import torch
 from torch import nn
 
-from ultralytics.nn.modules.dms import DWBlock
+
+
+class TeacherDWBlock(nn.Module):
+    """Teacher-only block; its checkpoint is independent of student ROI norm."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, 1, 1, groups=channels, bias=False),
+            nn.BatchNorm2d(channels), nn.SiLU(),
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.BatchNorm2d(channels), nn.SiLU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
 
 
 class CropTeacher(nn.Module):
@@ -22,8 +37,8 @@ class CropTeacher(nn.Module):
             nn.Conv2d(channels // 2, channels, 3, 2, 1, bias=False),
             nn.BatchNorm2d(channels),
             nn.SiLU(),
-            DWBlock(channels),
-            DWBlock(channels),
+            TeacherDWBlock(channels),
+            TeacherDWBlock(channels),
         )
         self.landmark = nn.Sequential(
             nn.ConvTranspose2d(channels, channels // 2, 2, 2), nn.SiLU(), nn.Conv2d(channels // 2, 12, 1)
