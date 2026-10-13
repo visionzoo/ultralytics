@@ -6,7 +6,7 @@ from collections.abc import Mapping
 
 import torch
 from torch import nn
-
+from ultralytics.nn.modules.dms_pose import POSE_AXES, decode_pose, pose_bin_count
 
 
 class TeacherDWBlock(nn.Module):
@@ -43,11 +43,21 @@ class CropTeacher(nn.Module):
         self.landmark = nn.Sequential(
             nn.ConvTranspose2d(channels, channels // 2, 2, 2), nn.SiLU(), nn.Conv2d(channels // 2, 12, 1)
         )
-        self.pose = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, 64), nn.SiLU(), nn.Linear(64, 3))
+        self.pose_pool = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, 64), nn.SiLU())
+        self.pose_bin = nn.ModuleDict({axis: nn.Linear(64, pose_bin_count(axis)) for axis in POSE_AXES})
+        self.pose_residual = nn.ModuleDict({axis: nn.Linear(64, 1) for axis in POSE_AXES})
 
     def forward(self, face_crop: torch.Tensor) -> dict[str, torch.Tensor]:
         feature = self.encoder(face_crop)
-        return {"face_feature": feature, "landmark_heatmap": self.landmark(feature), "pose_ypr": self.pose(feature)}
+        pose_feature = self.pose_pool(feature)
+        result = {
+            "face_feature": feature,
+            "landmark_heatmap": self.landmark(feature),
+            **{f"{axis}_bin_logits": self.pose_bin[axis](pose_feature) for axis in POSE_AXES},
+            **{f"{axis}_residual": 0.5 * torch.tanh(self.pose_residual[axis](pose_feature)) for axis in POSE_AXES},
+        }
+        result["pose_ypr"] = decode_pose(result)
+        return result
 
     def freeze(self) -> "CropTeacher":
         self.eval()

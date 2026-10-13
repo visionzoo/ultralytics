@@ -7,6 +7,8 @@ import importlib
 import torch
 from torch import nn
 
+from .dms_pose import POSE_AXES, decode_pose, pose_bin_count
+
 
 _ROI_HEAD_FACTORIES: dict[str, object] = {}
 
@@ -94,9 +96,9 @@ class DMSROIHeads(nn.Module):
             nn.ConvTranspose2d(channels, channels // 2, 2, 2), nn.SiLU(), nn.Conv2d(channels // 2, 12, 1)
         )
         self.landmark_logvar = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, 12))
-        # Keep the checkpoint-compatible pose head compact; pose improvement
-        # is driven by target normalization and balanced sampling below.
-        self.pose = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, 64), nn.SiLU(), nn.Linear(64, 3))
+        self.pose_pool = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, 64), nn.SiLU())
+        self.pose_bin = nn.ModuleDict({axis: nn.Linear(64, pose_bin_count(axis)) for axis in POSE_AXES})
+        self.pose_residual = nn.ModuleDict({axis: nn.Linear(64, 1) for axis in POSE_AXES})
 
     def forward(
         self, b2_rois: torch.Tensor, p3_rois: torch.Tensor, roi_valid: torch.Tensor | None = None
@@ -114,10 +116,13 @@ class DMSROIHeads(nn.Module):
                 "landmark_heatmap": empty.new_empty((0, 12, 64, 64)),
                 "landmark_logvar": empty.new_empty((0, 12)),
                 "pose_ypr": empty.new_empty((0, 3)),
+                **{f"{axis}_bin_logits": empty.new_empty((0, pose_bin_count(axis))) for axis in POSE_AXES},
+                **{f"{axis}_residual": empty.new_empty((0, 1)) for axis in POSE_AXES},
             }
         p3_rois = nn.functional.interpolate(p3_rois, size=(32, 32), mode="bilinear", align_corners=False)
         face = self.fuse(torch.cat((b2_rois, p3_rois), 1))
         part_values = self.parts(face).reshape(count, 3, 5)
+        pose_feature = self.pose_pool(face)
         result = {
             "face_feature": face,
             "part_box": part_values[..., :4].sigmoid(),
@@ -126,13 +131,18 @@ class DMSROIHeads(nn.Module):
             "mouth_state_logits": self.mouth_state(face).reshape(count, 1, self.mouth_states),
             "landmark_heatmap": self.landmark(face),
             "landmark_logvar": self.landmark_logvar(face).clamp(-4.0, 4.0),
-            "pose_ypr": self.pose(face),
+            **{f"{axis}_bin_logits": self.pose_bin[axis](pose_feature) for axis in POSE_AXES},
+            **{f"{axis}_residual": 0.5 * torch.tanh(self.pose_residual[axis](pose_feature)) for axis in POSE_AXES},
         }
+        result["pose_ypr"] = decode_pose(result)
         if roi_valid is not None:
             valid = roi_valid.to(dtype=face.dtype).reshape(count, 1)
             result["part_presence_logits"] = result["part_presence_logits"] * valid
             result["landmark_heatmap"] = result["landmark_heatmap"] * valid[:, :, None, None]
             result["pose_ypr"] = result["pose_ypr"] * valid
+            for axis in POSE_AXES:
+                result[f"{axis}_bin_logits"] = result[f"{axis}_bin_logits"] * valid
+                result[f"{axis}_residual"] = result[f"{axis}_residual"] * valid
         return result
 
 

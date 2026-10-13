@@ -10,6 +10,7 @@ from ultralytics.nn.modules.dms import build_roi_head, roi_align_features
 from ultralytics.nn.tasks import DetectionModel
 
 from .loss import DMSROILoss
+from ultralytics.nn.modules.dms_pose import POSE_BIN_CONFIG
 
 
 @dataclass
@@ -47,7 +48,9 @@ class DMSModel(DetectionModel):
             "roi_kwargs": self.roi_head_kwargs,
             "feature_strides": list(self.feature_strides),
             "feature_layers": list(self.feature_layers),
-            "landmark_decoder": "heatmap_local_softargmax_v2",
+            "landmark_decoder": "heatmap_quarter_pixel_v3",
+            "pose_decoder": "per_axis_soft_bin_expectation_residual_v1",
+            "pose_bin_config": POSE_BIN_CONFIG,
         }
         self.dms_criterion = DMSROILoss()
 
