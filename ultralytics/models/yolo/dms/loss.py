@@ -132,6 +132,11 @@ class DMSROILoss(nn.Module):
                 losses[f"pose_mae_{name}_deg"] = self._masked_mean(per_angle[:, index], valid).detach()
 
         # Metrics above are detached and must not contribute to optimization.
-        metric_names = {"landmark_nme", "pose_mae_deg"}
-        total = sum((value for name, value in losses.items() if name not in metric_names), zero)
+        # All MAE/NME entries are reporting metrics only. In particular, the
+        # per-axis pose MAE values must not be added to the optimized loss.
+        total = sum(
+            (value for name, value in losses.items()
+             if name != "landmark_nme" and not name.startswith("pose_mae_")),
+            zero,
+        )
         return total, losses
