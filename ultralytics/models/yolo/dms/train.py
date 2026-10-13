@@ -274,6 +274,7 @@ def train_teacher(
     target_pose_mae: float | None = None,
     pose_patience: int = 0,
     pose_min_delta: float = 0.1,
+    resume_checkpoint: str | Path | None = None,
 ) -> Path:
     """Train the RGB crop teacher on only landmark and pose train samples."""
     output = Path(output)
@@ -285,14 +286,24 @@ def train_teacher(
         pin_memory=False,
     )
     device_obj, device_ids = _cuda_devices(device)
-    teacher = CropTeacher().to(device_obj).train()
+    teacher = CropTeacher()
+    resume_epoch = 0
+    resumed_best_mae = float("inf")
+    if resume_checkpoint:
+        checkpoint = torch.load(resume_checkpoint, map_location="cpu", weights_only=False)
+        stored = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        teacher.load_state_dict(stored, strict=False)
+        if isinstance(checkpoint, dict):
+            resume_epoch = int(checkpoint.get("epoch", 0))
+            resumed_best_mae = float(checkpoint.get("metadata", {}).get("best_pose_val_mae_deg", float("inf")))
+    teacher = teacher.to(device_obj).train()
     teacher_parallel = _parallel(teacher, device_ids)
     criterion = DMSROILoss()
     optimizer = torch.optim.AdamW(teacher.parameters(), lr=lr)
     amp_enabled = device_obj.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     history = []
-    best_pose_mae = float("inf")
+    best_pose_mae = resumed_best_mae
     stale_epochs = 0
     writer = _tensorboard_writer(tb_log_dir)
     log_path = output / "teacher_train.log"
@@ -326,7 +337,8 @@ def train_teacher(
         if writer:
             for task, value in epoch_metrics.items():
                 writer.add_scalar(f"teacher/{task}_loss", value, epoch + 1)
-        message = f"{datetime.now().isoformat(timespec='seconds')} epoch={epoch + 1}/{epochs} " + " ".join(f"{task}_loss={value:.6f}" for task, value in sorted(epoch_metrics.items()))
+        display_epoch = resume_epoch + epoch + 1
+        message = f"{datetime.now().isoformat(timespec='seconds')} epoch={display_epoch}/{resume_epoch + epochs} " + " ".join(f"{task}_loss={value:.6f}" for task, value in sorted(epoch_metrics.items()))
         print(message, flush=True)
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(message + "\n")
@@ -334,7 +346,7 @@ def train_teacher(
         torch.save(
             {
                 "model": teacher.state_dict(),
-                "epoch": epoch + 1,
+                "epoch": display_epoch,
                 "history": history,
                 "metadata": {
                     "crop_size": crop_size,
@@ -629,6 +641,8 @@ def main() -> None:
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--train-teacher", action="store_true")
     parser.add_argument("--teacher-weights", type=Path)
+    parser.add_argument("--resume-teacher", type=Path,
+                        help="continue teacher training from an existing teacher.pt")
     parser.add_argument("--teacher-crop-size", type=int, default=128)
     parser.add_argument("--target-pose-mae", type=float)
     parser.add_argument("--pose-patience", type=int, default=0,
@@ -654,6 +668,7 @@ def main() -> None:
                 target_pose_mae=args.target_pose_mae,
                 pose_patience=args.pose_patience,
                 pose_min_delta=args.pose_min_delta,
+                resume_checkpoint=args.resume_teacher,
             )
         )
         return
