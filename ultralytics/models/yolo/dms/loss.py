@@ -108,7 +108,12 @@ class DMSROILoss(nn.Module):
             # HRNet-style heatmaps are trained as unconstrained score maps.
             # Applying sigmoid before MSE saturates negative logits and lets
             # the 64x64 background dominate, producing nearly empty maps.
-            heatmap_error = nn.functional.mse_loss(logits, target, reduction="none").mean((-1, -2))
+            pixel_error = nn.functional.mse_loss(logits, target, reduction="none")
+            # A 64x64 Gaussian occupies only a few pixels; unweighted MSE has
+            # an almost-zero all-background solution.  Weight the positive
+            # Gaussian mass while keeping the loss scale bounded per joint.
+            heatmap_weight = 1.0 + 10.0 * target
+            heatmap_error = (pixel_error * heatmap_weight).sum((-1, -2)) / heatmap_weight.sum((-1, -2)).clamp_min(1e-6)
             logvar = outputs.get("landmark_logvar", logits.new_zeros(logits.shape[:2])).clamp(-4.0, 4.0)
             # Use a differentiable full-map soft-argmax for training. The local
             # peak decoder intentionally uses argmax and is therefore not a
