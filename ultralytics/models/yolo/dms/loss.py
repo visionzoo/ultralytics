@@ -105,7 +105,10 @@ class DMSROILoss(nn.Module):
         if "landmark_xy" in batch and "landmark_valid" in batch:
             logits, points, valid = outputs["landmark_heatmap"], batch["landmark_xy"], batch["landmark_valid"].bool()
             target = self._heatmap_target(points, valid, logits.shape[-2], logits.shape[-1])
-            heatmap_error = nn.functional.mse_loss(logits.sigmoid(), target, reduction="none").mean((-1, -2))
+            # HRNet-style heatmaps are trained as unconstrained score maps.
+            # Applying sigmoid before MSE saturates negative logits and lets
+            # the 64x64 background dominate, producing nearly empty maps.
+            heatmap_error = nn.functional.mse_loss(logits, target, reduction="none").mean((-1, -2))
             logvar = outputs.get("landmark_logvar", logits.new_zeros(logits.shape[:2])).clamp(-4.0, 4.0)
             # Use a differentiable full-map soft-argmax for training. The local
             # peak decoder intentionally uses argmax and is therefore not a
@@ -165,7 +168,9 @@ class DMSROILoss(nn.Module):
         # per-axis pose MAE values must not be added to the optimized loss.
         total = sum(
             (value for name, value in losses.items()
-             if name != "landmark_nme" and not name.startswith("pose_mae_")),
+             if name != "landmark_nme"
+             and not name.startswith("pose_mae_")
+             and not (name.startswith("pose_") and name not in {"pose", "pose_mae_deg"})),
             zero,
         )
         return total, losses
