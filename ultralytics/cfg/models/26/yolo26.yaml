@@ -6,6 +6,7 @@
 
 # Parameters
 nc: 80 # number of classes
+scale: n # DMS currently uses the YOLO26-n compound scaling profile explicitly
 end2end: True # whether to use end-to-end mode
 reg_max: 1 # DFL bins
 dms:

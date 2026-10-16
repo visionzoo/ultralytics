@@ -12,10 +12,24 @@ from ultralytics.nn.modules.dms_pose import POSE_AXES, POSE_BIN_CONFIG, pose_bin
 class DMSROILoss(nn.Module):
     """Masked fixed-part, heatmap and pose losses for partially labelled batches."""
 
-    def __init__(self, heatmap_sigma: float = 1.5, shape_prior=None, pose_scale=(55.0, 12.0, 11.0), pose_center=(0.0, 0.0, 0.0)):
+    def __init__(
+        self, heatmap_sigma: float = 1.5, shape_prior=None,
+        pose_scale=(55.0, 12.0, 11.0), pose_center=(0.0, 0.0, 0.0),
+        yaw_bin_weight: float = 1.0, pose_continuous_weight: float = 1.0,
+        pose_yaw_continuous_weight: float = 3.0,
+        landmark_coord_weight: float = 1.0,
+        landmark_peak_weight: float = 0.25,
+        landmark_geometry_weight: float = 4.0,
+    ):
         super().__init__()
         self.heatmap_sigma = heatmap_sigma
         self.shape_prior = shape_prior
+        self.yaw_bin_weight = float(yaw_bin_weight)
+        self.pose_continuous_weight = float(pose_continuous_weight)
+        self.pose_yaw_continuous_weight = float(pose_yaw_continuous_weight)
+        self.landmark_coord_weight = float(landmark_coord_weight)
+        self.landmark_peak_weight = float(landmark_peak_weight)
+        self.landmark_geometry_weight = float(landmark_geometry_weight)
         self.register_buffer("pose_scale", torch.tensor(pose_scale, dtype=torch.float32), persistent=True)
         self.register_buffer("pose_center", torch.tensor(pose_center, dtype=torch.float32), persistent=True)
 
@@ -47,9 +61,12 @@ class DMSROILoss(nn.Module):
         return target * valid.to(dtype=target.dtype).unsqueeze(-1).unsqueeze(-1)
 
     @staticmethod
-    def _softargmax(logits: torch.Tensor) -> torch.Tensor:
+    def _softargmax(logits: torch.Tensor, temperature: float = 4.0) -> torch.Tensor:
+        """Differentiable coordinate expectation with a sharper training distribution."""
         height, width = logits.shape[-2:]
-        probabilities = logits.flatten(-2).softmax(-1).reshape(*logits.shape[:2], height, width)
+        probabilities = (logits * max(float(temperature), 1e-3)).flatten(-2).softmax(-1).reshape(
+            *logits.shape[:2], height, width
+        )
         x = torch.linspace(0, 1, width, device=logits.device, dtype=logits.dtype)
         y = torch.linspace(0, 1, height, device=logits.device, dtype=logits.dtype)
         return torch.stack((probabilities.sum(-2) @ x, probabilities.sum(-1) @ y), dim=-1)
@@ -61,20 +78,60 @@ class DMSROILoss(nn.Module):
         peaks = logits.flatten(-2).argmax(-1)
         cx, cy = peaks % width, peaks // width
         flat = logits.flatten(-2)
-        batch, joints = cx.shape
-        batch_index = torch.arange(batch, device=logits.device)[:, None]
-        joint_index = torch.arange(joints, device=logits.device)[None, :]
         dx = torch.zeros_like(cx, dtype=logits.dtype)
         dy = torch.zeros_like(cy, dtype=logits.dtype)
         interior_x = (cx > 0) & (cx < width - 1)
         interior_y = (cy > 0) & (cy < height - 1)
-        left = cy * width + (cx - 1)
-        right = cy * width + (cx + 1)
-        up = (cy - 1) * width + cx
-        down = (cy + 1) * width + cx
-        dx[interior_x] = 0.25 * torch.sign(flat[batch_index.expand_as(cx), joint_index.expand_as(cx), right][interior_x] - flat[batch_index.expand_as(cx), joint_index.expand_as(cx), left][interior_x])
-        dy[interior_y] = 0.25 * torch.sign(flat[batch_index.expand_as(cy), joint_index.expand_as(cy), down][interior_y] - flat[batch_index.expand_as(cy), joint_index.expand_as(cy), up][interior_y])
+        # Gather flattened neighbors rather than relying on CUDA advanced
+        # indexing with mixed broadcasted shapes. Clamp border indices so
+        # every gather is valid; the interior masks decide which offsets apply.
+        left = cy * width + (cx - 1).clamp_min(0)
+        right = cy * width + (cx + 1).clamp_max(width - 1)
+        up = (cy - 1).clamp_min(0) * width + cx
+        down = (cy + 1).clamp_max(height - 1) * width + cx
+        left_v = flat.gather(-1, left.unsqueeze(-1)).squeeze(-1)
+        right_v = flat.gather(-1, right.unsqueeze(-1)).squeeze(-1)
+        up_v = flat.gather(-1, up.unsqueeze(-1)).squeeze(-1)
+        down_v = flat.gather(-1, down.unsqueeze(-1)).squeeze(-1)
+        dx[interior_x] = 0.25 * torch.sign((right_v - left_v)[interior_x])
+        dy[interior_y] = 0.25 * torch.sign((down_v - up_v)[interior_y])
         return torch.stack(((cx.to(logits.dtype) + dx) / max(width - 1, 1), (cy.to(logits.dtype) + dy) / max(height - 1, 1)), dim=-1)
+
+    @staticmethod
+    def decode_heatmap_probability(
+        logits: torch.Tensor, temperature: float = 1.0
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Decode heatmaps as continuous probabilities with covariance.
+
+        Returns normalized coordinates ``[B,J,2]``, covariance ``[B,J,2,2]``
+        in the same normalized ROI frame, and per-joint entropy.  This is a
+        post-hoc decoder: the heatmap training target and network are unchanged.
+        """
+        if logits.ndim != 4:
+            raise ValueError("heatmap logits must have shape [B,J,H,W]")
+        _, _, height, width = logits.shape
+        temperature = max(float(temperature), 1e-3)
+        mass = logits.relu().flatten(-2)
+        total = mass.sum(-1, keepdim=True)
+        uniform = torch.full_like(mass, 1.0 / max(height * width, 1))
+        probabilities = torch.where(total > 1e-8, mass / total.clamp_min(1e-8), uniform)
+        if temperature != 1.0:
+            probabilities = probabilities.clamp_min(1e-8).log().div(temperature).softmax(-1)
+        probabilities = probabilities.reshape(*logits.shape[:2], height, width)
+        x = torch.linspace(0, 1, width, device=logits.device, dtype=logits.dtype)
+        y = torch.linspace(0, 1, height, device=logits.device, dtype=logits.dtype)
+        px = (probabilities.sum(-2) * x).sum(-1)
+        py = (probabilities.sum(-1) * y).sum(-1)
+        dx = x.view(1, 1, 1, width) - px.unsqueeze(-1).unsqueeze(-1)
+        dy = y.view(1, 1, height, 1) - py.unsqueeze(-1).unsqueeze(-1)
+        var_x = (probabilities * dx.square()).sum((-1, -2))
+        var_y = (probabilities * dy.square()).sum((-1, -2))
+        cov_xy = (probabilities * dx * dy).sum((-1, -2))
+        covariance = torch.stack(
+            (torch.stack((var_x, cov_xy), -1), torch.stack((cov_xy, var_y), -1)), -2
+        )
+        entropy = -(probabilities.clamp_min(1e-8) * probabilities.clamp_min(1e-8).log()).sum((-1, -2))
+        return torch.stack((px, py), -1), covariance, entropy
 
     @staticmethod
     def _state_loss(logits: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
@@ -109,11 +166,17 @@ class DMSROILoss(nn.Module):
             # Applying sigmoid before MSE saturates negative logits and lets
             # the 64x64 background dominate, producing nearly empty maps.
             pixel_error = nn.functional.mse_loss(logits, target, reduction="none")
-            # A 64x64 Gaussian occupies only a few pixels; unweighted MSE has
-            # an almost-zero all-background solution.  Weight the positive
-            # Gaussian mass while keeping the loss scale bounded per joint.
-            heatmap_weight = 1.0 + 10.0 * target
-            heatmap_error = (pixel_error * heatmap_weight).sum((-1, -2)) / heatmap_weight.sum((-1, -2)).clamp_min(1e-6)
+            # A 64x64 Gaussian occupies only a few pixels.  Even ``1+10*t``
+            # weighting still lets thousands of background pixels dominate.
+            # Normalize positive and negative regions separately so the peak
+            # cannot be learned as an all-background map.  Background remains
+            # useful as a weak suppression term, while the Gaussian mass is
+            # the primary spatial supervision.
+            positive = target
+            negative = (1.0 - target).clamp_min(0.0)
+            positive_error = (pixel_error * positive).sum((-1, -2)) / positive.sum((-1, -2)).clamp_min(1e-6)
+            negative_error = (pixel_error * negative).sum((-1, -2)) / negative.sum((-1, -2)).clamp_min(1e-6)
+            heatmap_error = positive_error + 0.1 * negative_error
             logvar = outputs.get("landmark_logvar", logits.new_zeros(logits.shape[:2])).clamp(-4.0, 4.0)
             # Use a differentiable full-map soft-argmax for training. The local
             # peak decoder intentionally uses argmax and is therefore not a
@@ -122,12 +185,54 @@ class DMSROILoss(nn.Module):
             decoded = self._softargmax(logits)
             coordinate_error = nn.functional.smooth_l1_loss(decoded, points, reduction="none").mean(-1)
             losses["landmark"] = self._masked_mean(torch.exp(-logvar) * heatmap_error + logvar, valid)
+            # Normalized MSE alone can be satisfied by a low-contrast,
+            # nearly uniform heatmap. Enforce channel-specific peak mass so
+            # deployment argmax/sub-pixel decoding remains identifiable.
+            target_probability = target.flatten(-2).div(
+                target.flatten(-2).sum(-1, keepdim=True).clamp_min(1e-6)
+            )
+            peak_error = -(target_probability * logits.flatten(-2).log_softmax(-1)).sum(-1)
+            losses["landmark_peak"] = self.landmark_peak_weight * self._masked_mean(peak_error, valid)
             # Heatmaps remain the primary representation; this is only a weak
             # stabilizer and must not replace their spatial supervision.
-            losses["landmark_coord"] = 0.1 * self._masked_mean(coordinate_error, valid)
-            # Reporting metric: mean normalized Euclidean error, excluded
-            # from the optimized total below.
-            losses["landmark_nme"] = self._masked_mean(torch.linalg.vector_norm(decoded - points, dim=-1), valid).detach()
+            losses["landmark_coord"] = self.landmark_coord_weight * self._masked_mean(coordinate_error, valid)
+            # Preserve the canonical two-eye geometry.  Pixel-wise heatmap
+            # losses can be minimized by diffuse peaks whose expectation
+            # collapses both eyes toward the face center; constraining the
+            # vector between the two eye centers prevents that failure while
+            # keeping heatmaps as the only deployed representation.
+            pred_left = decoded[:, (0, 3)].mean(1)
+            pred_right = decoded[:, (6, 9)].mean(1)
+            target_left = points[:, (0, 3)].mean(1)
+            target_right = points[:, (6, 9)].mean(1)
+            geometry_error = nn.functional.smooth_l1_loss(
+                pred_right - pred_left, target_right - target_left, reduction="none"
+            ).mean(-1)
+            losses["landmark_geometry"] = self.landmark_geometry_weight * self._masked_mean(
+                geometry_error, valid.any(-1)
+            )
+            # Report the same heatmap argmax/sub-pixel decoder used by
+            # deployment.  The differentiable expectation above remains an
+            # auxiliary training signal, but a diffuse heatmap can make its
+            # coordinates look wrong even when the learned peak is correct.
+            metric_decoded = self.decode_heatmap(logits)
+            metric_error = torch.linalg.vector_norm(metric_decoded - points, dim=-1)
+            losses["landmark_nme"] = self._masked_mean(metric_error, valid).detach()
+            # Report the protocol metric as well as the raw ROI-coordinate
+            # error.  The latter is useful for optimization diagnostics but
+            # is not Eye12 NME: it must be normalized by the distance between
+            # the two eye centers (corner pairs 0/3 and 6/9).
+            eye_left = points[:, (0, 3)].mean(1)
+            eye_right = points[:, (6, 9)].mean(1)
+            interocular = torch.linalg.vector_norm(eye_right - eye_left, dim=-1).clamp_min(1e-6)
+            eye12_nme = metric_error.mean(-1) / interocular
+            losses["landmark_eye12_nme"] = self._masked_mean(eye12_nme, valid.any(-1)).detach()
+            losses["landmark_soft_nme"] = self._masked_mean(
+                torch.linalg.vector_norm(decoded - points, dim=-1), valid
+            ).detach()
+            point_error = metric_error
+            losses["landmark_pck05"] = self._masked_mean((point_error <= 0.05).to(point_error.dtype), valid).detach()
+            losses["landmark_pck10"] = self._masked_mean((point_error <= 0.10).to(point_error.dtype), valid).detach()
             if self.shape_prior is not None:
                 losses["shape_prior"] = self.shape_prior(self._softargmax(logits), valid)
         if "pose_ypr" in batch and "pose_valid" in batch:
@@ -149,6 +254,8 @@ class DMSROILoss(nn.Module):
                     distance = (centers[None] - target_axis[:, None]).abs() / step
                     soft_target = torch.exp(-0.5 * distance.square()).div( torch.exp(-0.5 * distance.square()).sum(-1, keepdim=True).clamp_min(1e-8))
                     bin_loss = -(soft_target * outputs[f"{axis}_bin_logits"].log_softmax(-1)).sum(-1)
+                    if axis == "yaw":
+                        bin_loss = bin_loss * self.yaw_bin_weight
                     residual_target = (target_axis - centers[bin_index]) / step
                     residual_loss = nn.functional.smooth_l1_loss(
                         outputs[f"{axis}_residual"].squeeze(-1), residual_target, reduction="none"
@@ -157,6 +264,30 @@ class DMSROILoss(nn.Module):
                     losses[f"pose_{axis}_residual"] = self._masked_mean(residual_loss, valid)
                     axis_errors.append(losses[f"pose_{axis}_bin"] + losses[f"pose_{axis}_residual"])
                 pose_error = sum(axis_errors) / len(axis_errors)
+                # Bin/residual decoding is useful for large pose ranges, but
+                # the expected angle can still collapse to the train mean.
+                # Keep a direct normalized continuous term so every axis is
+                # trained against the actual degree target as well.
+                continuous_weights = outputs["pose_ypr"].new_tensor(
+                    (self.pose_yaw_continuous_weight, 1.0, 1.0)
+                )
+                # Replace the unweighted aggregate with the yaw-emphasized
+                # version while preserving valid-sample normalization.
+                losses["pose_continuous"] = self.pose_continuous_weight * self._masked_mean(
+                    nn.functional.smooth_l1_loss(pred_norm, target_norm, reduction="none")
+                    .mul(continuous_weights)
+                    .sum(-1) / continuous_weights.sum(), valid
+                )
+                # Keep an undiluted yaw term.  Averaging three axes can make
+                # the wide yaw range look inexpensive beside pitch/roll and
+                # lets an ROI head settle at the train mean.  This term still
+                # uses normalized degrees; public outputs remain degrees.
+                yaw_error = nn.functional.smooth_l1_loss(
+                    pred_norm[:, 0], target_norm[:, 0], reduction="none"
+                )
+                losses["pose_yaw_continuous"] = (
+                    self.pose_yaw_continuous_weight * self._masked_mean(yaw_error, valid)
+                )
             else:
                 # Compatibility path for old scalar-yaw checkpoints.
                 pose_error = nn.functional.smooth_l1_loss(pred_norm, target_norm, reduction="none").mean(-1)
@@ -174,8 +305,12 @@ class DMSROILoss(nn.Module):
         total = sum(
             (value for name, value in losses.items()
              if name != "landmark_nme"
+             and name != "landmark_soft_nme"
+             and not name.startswith("landmark_pck")
              and not name.startswith("pose_mae_")
-             and not (name.startswith("pose_") and name not in {"pose", "pose_mae_deg"})),
+             and not (name.startswith("pose_") and name not in {
+                 "pose", "pose_mae_deg", "pose_continuous", "pose_yaw_continuous"
+             })),
             zero,
         )
         return total, losses

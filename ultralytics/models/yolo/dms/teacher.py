@@ -72,16 +72,60 @@ def make_teacher_crops(image: torch.Tensor, face_rois: torch.Tensor, size: int =
 
 
 def distillation_loss(
-    student: Mapping[str, torch.Tensor], teacher: Mapping[str, torch.Tensor], valid: torch.Tensor
+    student: Mapping[str, torch.Tensor], teacher: Mapping[str, torch.Tensor], valid: torch.Tensor,
+    pose_scale: torch.Tensor | None = None, pose_valid: torch.Tensor | None = None,
+    pose_axis_weights: tuple[float, float, float] = (5.0, 1.0, 1.0),
+    bin_temperature: float = 2.0,
 ) -> dict[str, torch.Tensor]:
-    """Feature and heatmap KD, evaluated only for ROIs with matching labels."""
+    """Feature, heatmap, continuous pose and bin/residual KD for matching ROIs."""
     valid = valid.bool()
     if not valid.any():
         zero = student["face_feature"].sum() * 0
-        return {"kd_feature": zero, "kd_heatmap": zero}
+        return {"kd_feature": zero, "kd_heatmap": zero, "kd_pose": zero, "kd_pose_bins": zero}
     student_feature = nn.functional.normalize(student["face_feature"][valid], dim=1)
     teacher_feature = nn.functional.normalize(teacher["face_feature"][valid].detach(), dim=1)
-    return {
+    result = {
         "kd_feature": nn.functional.mse_loss(student_feature, teacher_feature),
         "kd_heatmap": nn.functional.mse_loss(student["landmark_heatmap"][valid], teacher["landmark_heatmap"][valid].detach()),
     }
+    # Pose KD must be a subset of the teacher-valid ROIs.  Intersecting the
+    # masks prevents a malformed mixed batch from supervising padded/invalid
+    # crops even when its pose_valid flag is set.
+    pose_mask = valid & (pose_valid.bool() if pose_valid is not None else valid)
+    if "pose_ypr" in student and "pose_ypr" in teacher and pose_mask.any():
+        scale = pose_scale if pose_scale is not None else student["pose_ypr"].new_tensor((55.0, 12.0, 11.0))
+        scale = scale.to(device=student["pose_ypr"].device, dtype=student["pose_ypr"].dtype).clamp_min(1.0)
+        axis_weights = student["pose_ypr"].new_tensor(pose_axis_weights)
+        pose_error = nn.functional.smooth_l1_loss(
+            student["pose_ypr"][pose_mask] / scale,
+            teacher["pose_ypr"][pose_mask].detach() / scale,
+            reduction="none",
+        ).mean(0)
+        for index, axis in enumerate(POSE_AXES):
+            result[f"kd_pose_{axis}"] = pose_error[index]
+        result["kd_pose"] = (pose_error * axis_weights).sum() / axis_weights.sum()
+        temperature = max(float(bin_temperature), 1e-3)
+        bin_terms = []
+        for index, axis in enumerate(POSE_AXES):
+            student_logits = student[f"{axis}_bin_logits"][pose_mask]
+            teacher_logits = teacher[f"{axis}_bin_logits"][pose_mask].detach()
+            student_log_prob = (student_logits / temperature).log_softmax(-1)
+            teacher_prob = (teacher_logits / temperature).softmax(-1)
+            bin_error = nn.functional.kl_div(student_log_prob, teacher_prob, reduction="batchmean") * temperature**2
+            residual_error = nn.functional.smooth_l1_loss(
+                student[f"{axis}_residual"][pose_mask], teacher[f"{axis}_residual"][pose_mask].detach()
+            )
+            result[f"kd_pose_bin_{axis}"] = bin_error
+            result[f"kd_pose_residual_{axis}"] = residual_error
+            bin_terms.append(bin_error + residual_error)
+            result[f"kd_pose_bin_acc_{axis}"] = (
+                (student_logits.argmax(-1) == teacher_logits.argmax(-1)).float().mean().detach()
+            )
+        result["kd_pose_bins"] = (torch.stack(bin_terms) * axis_weights).sum() / axis_weights.sum()
+        result["kd_pose_yaw_mae"] = (
+            (student["pose_ypr"][pose_mask, 0] - teacher["pose_ypr"][pose_mask, 0].detach()).abs().mean().detach()
+        )
+    else:
+        result["kd_pose"] = student["face_feature"].sum() * 0
+        result["kd_pose_bins"] = student["face_feature"].sum() * 0
+    return result

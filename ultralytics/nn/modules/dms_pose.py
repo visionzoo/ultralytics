@@ -5,7 +5,10 @@ from __future__ import annotations
 import torch
 
 POSE_AXES = ("yaw", "pitch", "roll")
-POSE_BIN_CONFIG = {"yaw": (-90.0, 90.0, 5.0), "pitch": (-45.0, 45.0, 5.0), "roll": (-90.0, 90.0, 5.0)}
+# 300W-LP contains pitch labels beyond +/-45 degrees.  Keep the public
+# contract in degrees while covering the observed training range; clipping
+# those labels would otherwise create systematic pitch supervision error.
+POSE_BIN_CONFIG = {"yaw": (-90.0, 90.0, 5.0), "pitch": (-60.0, 60.0, 5.0), "roll": (-90.0, 90.0, 5.0)}
 
 
 def pose_bin_count(axis: str) -> int:

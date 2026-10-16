@@ -21,6 +21,17 @@ def _box(values: list[float] | tuple[float, ...]) -> np.ndarray:
     return np.asarray(values, dtype=np.float32)
 
 
+def _square_box(box: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Square a face ROI with the same center-preserving rule as deployment."""
+    x1, y1, x2, y2 = box.astype(np.float32, copy=True)
+    size = max(float(x2 - x1), float(y2 - y1), 1.0)
+    cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+    x1, y1 = cx - size * 0.5, cy - size * 0.5
+    x1 = min(max(x1, 0.0), max(float(width) - size, 0.0))
+    y1 = min(max(y1, 0.0), max(float(height) - size, 0.0))
+    return np.asarray([x1, y1, x1 + size, y1 + size], dtype=np.float32)
+
+
 class DMSROIDataset(Dataset):
     """One manifest task per dataset; each sample carries exactly one face ROI."""
 
@@ -82,6 +93,7 @@ class DMSROIDataset(Dataset):
         image = cv2.imread(sample["image"])
         if image is None:
             raise FileNotFoundError(sample["image"])
+        image_height, image_width = image.shape[:2]
         face = _box(sample["face_box_xyxy"]).reshape(1, 4)
         points = None
         if self.task == "landmark":
@@ -94,6 +106,8 @@ class DMSROIDataset(Dataset):
             points = np.asarray(sample["points"], dtype=np.float32)
             face = np.asarray([[0, 0, width, height]], dtype=np.float32)
         source_face = face[0].copy()
+        if self.task != "landmark":
+            source_face = _square_box(source_face, image_width, image_height)
         # Encode the available source image once, preserving its context and
         # aspect ratio. Only features, not input pixels, are cropped for the
         # student. Eye12/300W-LP remain crop-only sources when no full frame is
@@ -101,7 +115,12 @@ class DMSROIDataset(Dataset):
         transform = LetterBox(new_shape=(self.image_size, self.image_size), auto=False, stride=32)
         params = transform.get_params({"img": image})
         image = transform(image=image)
-        face = source_face * np.asarray(params["ratio"] * 2, dtype=np.float32) + np.asarray(
+        # ``ratio`` is an ``(rx, ry)`` tuple.  Expand it explicitly to
+        # ``(rx, ry, rx, ry)`` for xyxy coordinates; avoid ambiguous Python
+        # tuple multiplication and keep the mapping valid for non-square
+        # source images.
+        ratio = np.asarray(params["ratio"], dtype=np.float32)
+        face = source_face * np.tile(ratio, 2) + np.asarray(
             [params["left"], params["top"], params["left"], params["top"]], dtype=np.float32
         )
         img = torch.from_numpy(np.ascontiguousarray(image[..., ::-1].transpose(2, 0, 1)))
@@ -125,7 +144,7 @@ class DMSROIDataset(Dataset):
             part_present_valid = torch.zeros(3, dtype=torch.bool)
             eye_state, eye_state_valid = torch.full((2,), -1), torch.zeros(2, dtype=torch.bool)
             mouth_state, mouth_state_valid = torch.full((1,), -1), torch.zeros(1, dtype=torch.bool)
-            original_face = _box(sample["face_box_xyxy"])
+            original_face = source_face
             for target in sample["targets"]:
                 part = target["part"]
                 raw_box = _box([target["box"][axis] for axis in ("x1", "y1", "x2", "y2")])

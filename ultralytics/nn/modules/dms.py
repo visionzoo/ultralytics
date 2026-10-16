@@ -92,8 +92,23 @@ class DMSROIHeads(nn.Module):
         self.parts = nn.Sequential(DWBlock(channels), nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, 15))
         self.eye_state = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, 2 * eye_states))
         self.mouth_state = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, mouth_states))
+        # Keep the heatmap as the only deployed landmark representation, but
+        # give it a small refinement tower instead of asking one deconvolution
+        # to recover all 12 points from the fused ROI feature.  This is still
+        # an ROI head (the YOLO detector/backbone is untouched) and materially
+        # improves spatial detail on Eye12 without adding a coordinate-output
+        # shortcut.
+        refine_channels = max(channels // 2, 32)
         self.landmark = nn.Sequential(
-            nn.ConvTranspose2d(channels, channels // 2, 2, 2), nn.SiLU(), nn.Conv2d(channels // 2, 12, 1)
+            nn.Conv2d(channels, channels, 3, 1, 1, bias=False),
+            nn.GroupNorm(8 if channels % 8 == 0 else 1, channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, refine_channels, 3, 1, 1, bias=False),
+            nn.GroupNorm(8 if refine_channels % 8 == 0 else 1, refine_channels),
+            nn.SiLU(),
+            nn.ConvTranspose2d(refine_channels, refine_channels, 2, 2),
+            nn.SiLU(),
+            nn.Conv2d(refine_channels, 12, 1),
         )
         self.landmark_logvar = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, 12))
         self.pose_pool = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, 64), nn.SiLU())

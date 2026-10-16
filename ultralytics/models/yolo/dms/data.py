@@ -147,23 +147,37 @@ def parse_300wlp_mat(path: str | Path) -> PoseRecord:
         raise ImportError("300W-LP parsing requires scipy") from exc
     mat_path = Path(path)
     data = loadmat(mat_path)
-    roi = np.asarray(data["roi"], dtype=np.float64).reshape(-1)
     pose = np.asarray(data["Pose_Para"], dtype=np.float64).reshape(-1)
-    if roi.size < 4 or pose.size < 3:
+    if pose.size < 3:
         raise ValueError(f"invalid 300W-LP annotation: {mat_path}")
     pitch, yaw, roll = np.degrees(pose[:3])
-    # 300W-LP's generated JPG is already a 450x450 canonical crop.  The MAT
-    # ``roi`` belongs to the pre-crop source image, so it must not be applied
-    # to the generated JPG coordinates.  Use the actual generated image bounds
-    # as the ROI; this is the same full-frame contract used by deployment after
-    # its face crop.
+    # ``roi`` is in the pre-crop source-image coordinate system and must not be
+    # applied directly to the generated JPG.  ``pt2d``, however, is already in
+    # the generated 450x450 image coordinate system.  Use its tight face box
+    # (with a small context margin) so pose training sees the same face ROI
+    # geometry as the detector-driven deployment path.  Falling back to the
+    # full image is retained for malformed legacy MAT files.
     image_path = mat_path.with_suffix(".jpg")
     image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
     if image is None or image.ndim < 2:
         raise ValueError(f"missing 300W-LP image for annotation: {image_path}")
     height, width = image.shape[:2]
+    points = np.asarray(data.get("pt2d", []), dtype=np.float64)
+    if points.shape[0] == 2 and points.shape[1] >= 3:
+        x_min, y_min = points[:, :].min(axis=1)
+        x_max, y_max = points[:, :].max(axis=1)
+        margin_x = max(2.0, (x_max - x_min) * 0.10)
+        margin_y = max(2.0, (y_max - y_min) * 0.10)
+        face_box = Box(
+            max(0.0, float(x_min - margin_x)),
+            max(0.0, float(y_min - margin_y)),
+            min(float(width), float(x_max + margin_x)),
+            min(float(height), float(y_max + margin_y)),
+        )
+    else:
+        face_box = Box(0.0, 0.0, float(width), float(height))
     return PoseRecord(
-        image_path, Box(0.0, 0.0, float(width), float(height)), (float(yaw), float(pitch), float(roll))
+        image_path, face_box, (float(yaw), float(pitch), float(roll))
     )
 
 

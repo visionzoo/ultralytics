@@ -7,7 +7,9 @@ import copy
 import csv
 import json
 import multiprocessing as mp
+import os
 import random
+import shutil
 import sys
 from datetime import datetime
 from collections.abc import Iterator
@@ -30,6 +32,20 @@ from .loss import DMSROILoss
 from .schema import LANDMARK_NAMES, ROI_INPUT_CONTRACT
 from .teacher import CropTeacher, distillation_loss, make_teacher_crops
 from dms.shape_bayes import ShapeBayesPrior
+
+
+def _atomic_torch_save(payload, target: Path) -> None:
+    """Write a checkpoint atomically so interruption cannot corrupt it."""
+    target = Path(target)
+    temporary = target.with_name(target.name + ".tmp")
+    torch.save(payload, temporary)
+    try:
+        os.replace(temporary, target)
+    except PermissionError:
+        # CIFS/SMB mounts can reject rename-over-existing-file even when the
+        # directory is writable.  Fall back to a verified copy and cleanup.
+        shutil.copyfile(temporary, target)
+        temporary.unlink(missing_ok=True)
 
 
 def _tensorboard_writer(log_dir: str | Path | None):
@@ -190,7 +206,27 @@ def load_dms_weights(model: DMSModel, weights: str | Path | None) -> DMSModel:
                     "DMS ROI checkpoint architecture does not match the configured model: "
                     f"checkpoint={stored_architecture}, model={model.dms_architecture}"
                 )
-        model.load_state_dict(stored, strict=False)
+        # ``strict=False`` still raises on same-name shape changes.  ROI heads
+        # are intentionally replaceable (for example, a higher-capacity
+        # heatmap refinement tower), so load only compatible tensors and let
+        # newly introduced layers keep their initialization.
+        current = model.state_dict()
+        compatible = {}
+        for key, value in stored.items():
+            if key not in current:
+                continue
+            try:
+                shape_ok = tuple(current[key].shape) == tuple(value.shape)
+            except RuntimeError:
+                # LazyConv2d has no shape until the first ROI forward.  Its
+                # checkpoint tensor is exactly what should initialize it.
+                shape_ok = True
+            if shape_ok:
+                compatible[key] = value
+        skipped = sorted(set(stored) - set(compatible))
+        if skipped:
+            print(f"dms_weight_skip_incompatible={skipped[:8]}", flush=True)
+        model.load_state_dict(compatible, strict=False)
     else:
         model.load(checkpoint)
     return model
@@ -275,6 +311,7 @@ def train_teacher(
     target_pose_mae: float | None = None,
     pose_patience: int = 0,
     pose_min_delta: float = 0.1,
+    pose_task_weight: float = 3.0,
     resume_checkpoint: str | Path | None = None,
 ) -> Path:
     """Train the RGB crop teacher on only landmark and pose train samples."""
@@ -314,11 +351,15 @@ def train_teacher(
     writer = _tensorboard_writer(tb_log_dir)
     log_path = output / "teacher_train.log"
     tasks = tuple(loaders)
+    # Landmark and pose use separate batches.  Give pose more opportunities
+    # because yaw is the primary objective and the old uniform task choice
+    # made it receive only about half of the teacher updates.
+    task_weights = {"landmark": 1.0, "pose": max(float(pose_task_weight), 0.0)}
     log_path.write_text(f"{datetime.now().isoformat(timespec='seconds')} teacher training start\n", encoding="utf-8")
     for epoch in range(epochs):
-        totals, counts = {}, {}
+        totals, counts, item_totals, item_counts = {}, {}, {}, {}
         for _ in range(steps_per_epoch):
-            task = random.choice(tasks)
+            task = random.choices(tasks, weights=[task_weights.get(item, 1.0) for item in tasks], k=1)[0]
             batch = _device_batch(next(loaders[task]), device_obj)
             batch["img"] = batch["img"].float() / 255
             optimizer.zero_grad(set_to_none=True)
@@ -347,7 +388,7 @@ def train_teacher(
         if pose_val_yaw < best_pose_mae - pose_min_delta:
             best_pose_mae, stale_epochs = pose_val_yaw, 0
             best_state = copy.deepcopy(teacher.state_dict())
-            torch.save(
+            _atomic_torch_save(
                 {
                     "model": best_state,
                     "epoch": display_epoch,
@@ -366,7 +407,7 @@ def train_teacher(
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(message + "\n")
         _write_teacher_artifacts(output, history)
-        torch.save(
+        _atomic_torch_save(
             {
                 "model": teacher.state_dict(),
                 "epoch": display_epoch,
@@ -395,7 +436,7 @@ def train_teacher(
             break
     if best_state is not None:
         teacher.load_state_dict(best_state, strict=False)
-        torch.save(
+        _atomic_torch_save(
             {
                 "model": teacher.state_dict(),
                 "epoch": resume_epoch + len(history),
@@ -404,6 +445,7 @@ def train_teacher(
                     "crop_size": crop_size,
                     "landmark_names": LANDMARK_NAMES,
                     "pose_order": "yaw_pitch_roll_deg",
+                    "best_pose_val_yaw_mae_deg": best_pose_mae,
                     "best_pose_val_mae_deg": best_pose_mae,
                 },
             },
@@ -421,6 +463,9 @@ def _student_roi_loss(
     teacher_crop_size: int,
     kd_feature_weight: float,
     kd_heatmap_weight: float,
+    kd_pose_weight: float,
+    kd_pose_bin_weight: float,
+    kd_pose_yaw_weight: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     if roi_forward is None:
         outputs = model.forward_dms(batch["img"], batch["face_rois"], batch.get("roi_valid"))
@@ -431,8 +476,12 @@ def _student_roi_loss(
     if teacher is not None and valid.any():
         with torch.inference_mode():
             teacher_outputs = teacher(make_teacher_crops(batch["img"], batch["face_rois"], teacher_crop_size))
-        kd = distillation_loss(outputs, teacher_outputs, valid)
+        kd = distillation_loss(
+            outputs, teacher_outputs, valid, model.dms_criterion.pose_scale, batch.get("pose_valid"),
+            pose_axis_weights=(kd_pose_yaw_weight, 1.0, 1.0),
+        )
         total = total + kd_feature_weight * kd["kd_feature"] + kd_heatmap_weight * kd["kd_heatmap"]
+        total = total + kd_pose_weight * kd["kd_pose"] + kd_pose_bin_weight * kd["kd_pose_bins"]
         items.update(kd)
     return total, items
 
@@ -452,16 +501,31 @@ def _evaluate_roi_epoch(
         dataset = DMSROIDataset(path, task, image_size, "test")
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_roi, num_workers=0)
         totals, count = {}, 0
+        pose_sum = pose_sq = None
         for batch in loader:
             batch = _device_batch(batch, device)
             batch["img"] = batch["img"].float() / 255
-            _, items = model.loss(batch)
-            batch_count = len(dataset) if len(dataset) < batch_size else batch["img"].shape[0]
+            outputs = model.forward_dms(batch["img"], batch["face_rois"], batch.get("roi_valid"))
+            _, items = model.dms_criterion(outputs, batch)
+            # The final batch may be smaller than ``batch_size``.  Weight each
+            # batch by its actual sample count, otherwise validation means are
+            # biased whenever len(dataset) is not divisible by batch_size.
+            batch_count = int(batch["img"].shape[0])
             count += batch_count
             for name, value in items.items():
                 totals[name] = totals.get(name, 0.0) + float(value) * batch_count
+            if task == "pose":
+                prediction = outputs["pose_ypr"].detach()
+                pose_sum = prediction.sum(0) if pose_sum is None else pose_sum + prediction.sum(0)
+                pose_sq = prediction.square().sum(0) if pose_sq is None else pose_sq + prediction.square().sum(0)
         for name, value in totals.items():
             results[f"{task}/{name}"] = value / max(count, 1)
+        if task == "pose" and pose_sum is not None:
+            mean = pose_sum / max(count, 1)
+            std = (pose_sq / max(count, 1) - mean.square()).clamp_min(0).sqrt()
+            for index, axis in enumerate(("yaw", "pitch", "roll")):
+                results[f"pose/pred_{axis}_mean_deg"] = float(mean[index])
+                results[f"pose/pred_{axis}_std_deg"] = float(std[index])
     model.model.eval()
     model.dms_heads.train()
     return results
@@ -482,6 +546,9 @@ def train_roi(
     teacher_crop_size: int = 128,
     kd_feature_weight: float = 1.0,
     kd_heatmap_weight: float = 1.0,
+    kd_pose_weight: float = 1.0,
+    kd_pose_bin_weight: float = 1.0,
+    kd_pose_yaw_weight: float = 5.0,
     workers: int = 0,
     amp: bool = True,
     tb_log_dir: str | Path | None = None,
@@ -490,13 +557,23 @@ def train_roi(
     pose_weight: float = 3.0,
     landmark_weight: float = 2.0,
     parts_weight: float = 1.0,
+    yaw_bin_weight: float = 1.5,
+    pose_continuous_weight: float = 1.0,
+    pose_yaw_continuous_weight: float = 3.0,
+    landmark_coord_weight: float = 1.0,
+    landmark_peak_weight: float = 0.25,
+    landmark_geometry_weight: float = 4.0,
+    val_interval: int = 1,
+    pin_memory: bool = True,
 ) -> Path:
     """Train heterogeneous ROI batches; global detector training stays with DetectionTrainer."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     # Build all CPU-side readers before model.to(cuda).  This ordering is
     # required when the dataset lives on a shared filesystem.
-    loaders = _roi_loaders(Path(manifest_dir), image_size, batch_size, "train", workers=workers, pin_memory=False)
+    loaders = _roi_loaders(Path(manifest_dir), image_size, batch_size, "train", workers=workers, pin_memory=pin_memory)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
     device_obj, device_ids = _cuda_devices(device)
     # A partially unfrozen backbone is not safe with the compact single-
     # process DataParallel adapter: replicas can race on mutable BN/state.
@@ -527,6 +604,12 @@ def train_roi(
         model.dms_criterion.shape_prior = shape_prior.to(device_obj)
     pose_center, pose_scale = _pose_train_stats(Path(manifest_dir))
     model.dms_criterion.set_pose_stats(pose_center, pose_scale)
+    model.dms_criterion.yaw_bin_weight = float(yaw_bin_weight)
+    model.dms_criterion.pose_continuous_weight = float(pose_continuous_weight)
+    model.dms_criterion.pose_yaw_continuous_weight = float(pose_yaw_continuous_weight)
+    model.dms_criterion.landmark_coord_weight = float(landmark_coord_weight)
+    model.dms_criterion.landmark_peak_weight = float(landmark_peak_weight)
+    model.dms_criterion.landmark_geometry_weight = float(landmark_geometry_weight)
     if teacher is not None:
         teacher.to(device_obj).freeze()
     task_weights = task_weights or {
@@ -542,14 +625,35 @@ def train_roi(
     groups = ([{"params": backbone_params, "lr": backbone_lr}] if backbone_params else [])
     groups.append({"params": head_params, "lr": lr})
     optimizer = torch.optim.AdamW(groups)
+    # The pose bin/residual heads are sensitive to a constant high learning
+    # rate: yaw can improve for a few epochs and then jump back toward the
+    # mean while the heatmap keeps changing.  A short warm-up is already
+    # provided by the first epochs; cosine decay stabilizes the joint metric
+    # without introducing task-specific dynamic weighting.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(int(epochs), 1), eta_min=float(lr) * 0.05
+    )
     roi_forward = _parallel(_ROIForward(model), device_ids)
     amp_enabled = bool(amp and device_obj.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     history = []
     validation_history = []
     writer = _tensorboard_writer(tb_log_dir)
+    best_metric = float("inf")
+    # Select a checkpoint using both primary ROI quality signals.  A yaw-only
+    # selector can preserve a model whose Eye12 heatmaps are visibly unusable.
+    # The scales make 20 degrees of yaw error comparable to 1.0 Eye12 NME.
+    best_metric_name = "joint/yaw20_plus_eye12_nme"
+    log_path = output / "roi_train.log"
+    log_path.write_text(f"{datetime.now().isoformat(timespec='seconds')} roi training start\n", encoding="utf-8")
+    print(
+        f"roi_backbone_unfreeze={list(unfreeze_layers)} roi_backbone_params={len(backbone_params)} "
+        f"roi_head_params={len(head_params)}",
+        flush=True,
+    )
     for epoch in range(epochs):
         totals, counts = {}, {}
+        item_totals, item_counts = {}, {}
         for _ in range(steps_per_epoch):
             task = random.choices(tasks, weights=[task_weights[item] for item in tasks], k=1)[0]
             batch = _device_batch(next(loaders[task]), device_obj)
@@ -557,7 +661,8 @@ def train_roi(
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
                 loss, items = _student_roi_loss(
-                    model, roi_forward, batch, teacher, teacher_crop_size, kd_feature_weight, kd_heatmap_weight
+                    model, roi_forward, batch, teacher, teacher_crop_size, kd_feature_weight, kd_heatmap_weight,
+                    kd_pose_weight, kd_pose_bin_weight, kd_pose_yaw_weight
                 )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -566,25 +671,42 @@ def train_roi(
             scaler.update()
             totals[task] = totals.get(task, 0.0) + float(loss.detach())
             counts[task] = counts.get(task, 0) + 1
-        history.append({task: totals[task] / counts[task] for task in totals})
-        validation_history.append(_evaluate_roi_epoch(model, Path(manifest_dir), image_size, batch_size, device_obj))
+            for name, value in items.items():
+                if name.startswith("kd_"):
+                    item_totals[name] = item_totals.get(name, 0.0) + float(value.detach())
+                    item_counts[name] = item_counts.get(name, 0) + 1
+        scheduler.step()
+        epoch_train = {task: totals[task] / counts[task] for task in totals}
+        epoch_metrics = {name: item_totals[name] / item_counts[name] for name in item_totals}
+        epoch_record = {**epoch_train, "metrics": epoch_metrics} if epoch_metrics else epoch_train
+        history.append(epoch_record)
+        if (epoch + 1) % max(int(val_interval), 1) == 0 or epoch == epochs - 1 or not validation_history:
+            validation_history.append(_evaluate_roi_epoch(model, Path(manifest_dir), image_size, batch_size, device_obj))
+        else:
+            # Keep a row aligned to every training epoch for TensorBoard and
+            # downstream parsers; values are explicitly marked stale.
+            validation_history.append({"validation_skipped": float(val_interval)})
         if writer:
-            for task, value in history[-1].items():
+            for task, value in epoch_train.items():
                 writer.add_scalar(f"roi/train/{task}", value, epoch + 1)
+            for name, value in epoch_metrics.items():
+                writer.add_scalar(f"roi/train/{name}", value, epoch + 1)
             for name, value in validation_history[-1].items():
                 writer.add_scalar(f"roi/val/{name}", value, epoch + 1)
-        print(
+        message = (
             f"{datetime.now().isoformat(timespec='seconds')} epoch={epoch + 1}/{epochs} "
-            f"train={history[-1]} val={validation_history[-1]}",
-            flush=True,
+            f"train={history[-1]} val={validation_history[-1]}"
         )
+        print(message, flush=True)
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(message + "\n")
         # Keep metrics inspectable while a long run is still in progress.
         (output / "roi_train_metrics.json").write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
         (output / "roi_validation_metrics.json").write_text(
             json.dumps(validation_history, indent=2) + "\n", encoding="utf-8"
         )
-        # Backbone adaptation is kept in the ROI checkpoint for analysis, but
-        # is not deploy-merged unless global Detect is jointly fine-tuned.
+        # Record exactly which encoder layers were adapted.  The merge step
+        # imports these layers while leaving the global Detect head untouched.
         merge_prefixes = ["dms_heads.", "dms_adapter.", "dms_criterion."]
         checkpoint = {
             "model": model.state_dict(),
@@ -592,12 +714,33 @@ def train_roi(
                 "roi_input_contract": ROI_INPUT_CONTRACT,
                 "dms_architecture": model.dms_architecture,
                 "merge_prefixes": merge_prefixes,
+                "adapted_model_layers": list(unfreeze_layers),
+                "selection_metric": best_metric_name,
             },
             "epoch": epoch + 1,
             "history": history,
             "validation_history": validation_history,
         }
-        torch.save(checkpoint, output / "last.pt")
+        _atomic_torch_save(checkpoint, output / "last.pt")
+        yaw_metric = validation_history[-1].get("pose/pose_mae_yaw_deg")
+        eye12_metric = validation_history[-1].get("landmark/landmark_eye12_nme")
+        if yaw_metric is not None and eye12_metric is not None:
+            metric = float(yaw_metric) / 20.0 + float(eye12_metric)
+            checkpoint["metadata"]["selection_metric"] = best_metric_name
+            checkpoint["metadata"]["joint_metric"] = float(metric)
+        else:
+            metric = sum(float(value) for value in validation_history[-1].values())
+            checkpoint["metadata"]["selection_metric"] = "validation_loss_sum"
+        if float(metric) < best_metric:
+            best_metric = float(metric)
+            checkpoint["metadata"]["best_metric"] = best_metric
+            _atomic_torch_save(checkpoint, output / "best.pt")
+    if not (output / "best.pt").is_file() and (output / "last.pt").is_file():
+        import shutil
+        shutil.copy2(output / "last.pt", output / "best.pt")
+    if writer:
+        writer.flush()
+        writer.close()
     (output / "roi_train_metrics.json").write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
     (output / "roi_validation_metrics.json").write_text(json.dumps(validation_history, indent=2) + "\n", encoding="utf-8")
     try:
@@ -605,7 +748,9 @@ def train_roi(
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        tasks_seen = sorted({name for row in history for name in row})
+        # ``metrics`` is a nested bookkeeping object, not a scalar loss.
+        # Keep it in JSON, but do not pass it to matplotlib as a curve.
+        tasks_seen = sorted({name for row in history for name, value in row.items() if isinstance(value, (int, float))})
         fig, axes = plt.subplots(max(1, len(tasks_seen)), 1, figsize=(9, 3 * max(1, len(tasks_seen))), squeeze=False)
         axes = [axis for row in axes for axis in row]
         for axis, task in zip(axes, tasks_seen):
@@ -650,11 +795,15 @@ def evaluate_roi(
         dataset = DMSROIDataset(path, task, image_size, "test")
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_roi, num_workers=0)
         losses = []
+        seen = 0
         for batch in loader:
+            if batches_per_task > 0 and seen >= batches_per_task:
+                break
             batch = _device_batch(batch, device_obj)
             batch["img"] = batch["img"].float() / 255
             loss, _ = model.loss(batch)
             losses.append(float(loss))
+            seen += 1
         results[f"{task}_loss"] = sum(losses) / len(losses)
     return results
 
@@ -671,11 +820,19 @@ def main() -> None:
     parser.add_argument("--steps-per-epoch", type=int, default=100)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--val-interval", type=int, default=1)
+    parser.add_argument("--no-pin-memory", action="store_true")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--backbone-lr", type=float, default=1e-5)
     parser.add_argument("--pose-weight", type=float, default=3.0)
     parser.add_argument("--landmark-weight", type=float, default=2.0)
     parser.add_argument("--parts-weight", type=float, default=1.0)
+    parser.add_argument("--yaw-bin-weight", type=float, default=1.5)
+    parser.add_argument("--pose-continuous-weight", type=float, default=1.0)
+    parser.add_argument("--pose-yaw-continuous-weight", type=float, default=3.0)
+    parser.add_argument("--landmark-coord-weight", type=float, default=1.0)
+    parser.add_argument("--landmark-peak-weight", type=float, default=0.25)
+    parser.add_argument("--landmark-geometry-weight", type=float, default=4.0)
     parser.add_argument("--unfreeze-layers", default="", help="comma-separated YOLO layer indices")
     parser.add_argument("--tb-log-dir")
     parser.add_argument("--eval", action="store_true")
@@ -689,8 +846,12 @@ def main() -> None:
     parser.add_argument("--pose-patience", type=int, default=0,
                         help="stop after this many validation epochs without improvement; 0 disables")
     parser.add_argument("--pose-min-delta", type=float, default=0.1)
+    parser.add_argument("--teacher-pose-task-weight", type=float, default=3.0)
     parser.add_argument("--kd-feature-weight", type=float, default=1.0)
     parser.add_argument("--kd-heatmap-weight", type=float, default=1.0)
+    parser.add_argument("--kd-pose-weight", type=float, default=1.0)
+    parser.add_argument("--kd-pose-bin-weight", type=float, default=1.0)
+    parser.add_argument("--kd-pose-yaw-weight", type=float, default=5.0)
     args = parser.parse_args()
     if args.train_teacher:
         print(
@@ -709,6 +870,7 @@ def main() -> None:
                 target_pose_mae=args.target_pose_mae,
                 pose_patience=args.pose_patience,
                 pose_min_delta=args.pose_min_delta,
+                pose_task_weight=args.teacher_pose_task_weight,
                 resume_checkpoint=args.resume_teacher,
             )
         )
@@ -735,6 +897,9 @@ def main() -> None:
                 teacher_crop_size=args.teacher_crop_size,
                 kd_feature_weight=args.kd_feature_weight,
                 kd_heatmap_weight=args.kd_heatmap_weight,
+                kd_pose_weight=args.kd_pose_weight,
+                kd_pose_bin_weight=args.kd_pose_bin_weight,
+                kd_pose_yaw_weight=args.kd_pose_yaw_weight,
                 workers=args.workers,
                 lr=args.lr,
                 tb_log_dir=args.tb_log_dir,
@@ -743,6 +908,14 @@ def main() -> None:
                 pose_weight=args.pose_weight,
                 landmark_weight=args.landmark_weight,
                 parts_weight=args.parts_weight,
+                yaw_bin_weight=args.yaw_bin_weight,
+                pose_continuous_weight=args.pose_continuous_weight,
+                pose_yaw_continuous_weight=args.pose_yaw_continuous_weight,
+                landmark_coord_weight=args.landmark_coord_weight,
+                landmark_peak_weight=args.landmark_peak_weight,
+                landmark_geometry_weight=args.landmark_geometry_weight,
+                val_interval=args.val_interval,
+                pin_memory=not args.no_pin_memory,
             )
         )
 

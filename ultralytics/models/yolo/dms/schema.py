@@ -112,4 +112,3 @@ def part_target(obj: DMSObject) -> PartTarget | None:
     if label in {"staring", "squint"}:
         return PartTarget("eye", label, obj.box, label)
     return None
-

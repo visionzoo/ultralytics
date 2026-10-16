@@ -127,12 +127,32 @@ def build_manifests(
     global_yolo_output: Path | None = None,
     split_seed: int = 20260916,
     link_mode: str = "hardlink",
+    max_dsm: int | None = None,
+    max_eye12: int | None = None,
+    max_pose: int | None = None,
 ) -> dict[str, int | str]:
     """Materialize source records without copying images or silently dropping ambiguity."""
     dsm_records = list(iter_dsm(dsm_root))
+    if max_dsm:
+        dsm_records = sorted(dsm_records, key=lambda record: str(record.annotation))[:max_dsm]
     dsm_splits = _split_paths([record.annotation for record in dsm_records], split_seed)
     pose_sources = sorted(wlp_root.glob("**/*.mat"))
+    if max_pose:
+        # Stable hash ordering avoids filesystem-order bias while making a
+        # 10k cap reproducible across mounts.
+        pose_sources = sorted(pose_sources, key=lambda path: hashlib.sha256(str(path).encode()).hexdigest())[:max_pose]
     pose_splits = _split_paths(pose_sources, split_seed)
+    # Do not materialize the entire Eye12 corpus (it can exceed 150k records)
+    # just to cap it at 10k; that previously made preparation get OOM-killed.
+    eye_records = []
+    eye_limit = max_eye12 or 0
+    for source in _eye12_sources(eye12_root):
+        for record in iter_eye12(source):
+            eye_records.append(record)
+            if eye_limit and len(eye_records) >= eye_limit:
+                break
+        if eye_limit and len(eye_records) >= eye_limit:
+            break
     counts = {
         "dsm": _write_jsonl(
             output / "dsm.jsonl",
@@ -150,8 +170,7 @@ def build_manifests(
                     "alignment_matrix": record.alignment_matrix,
                     "split": record.split,
                 }
-                for source in _eye12_sources(eye12_root)
-                for record in iter_eye12(source)
+                for record in eye_records
             ),
         ),
         "pose": _write_jsonl(
@@ -180,8 +199,7 @@ def build_manifests(
                 for point in record.points
             ]
         }
-        for source in _eye12_sources(eye12_root)
-        for record in iter_eye12(source)
+        for record in eye_records
     ]
     (output / "shape_prior.json").write_text(
         json.dumps(fit_shape_prior(eye_rows), indent=2) + "\n", encoding="utf-8"
@@ -204,6 +222,9 @@ def main() -> None:
     parser.add_argument("--global-yolo-output", type=Path)
     parser.add_argument("--split-seed", type=int, default=20260916)
     parser.add_argument("--link-mode", choices=("symlink", "hardlink", "copy"), default="hardlink")
+    parser.add_argument("--max-dsm", type=int)
+    parser.add_argument("--max-eye12", type=int)
+    parser.add_argument("--max-pose", type=int)
     args = parser.parse_args()
     wlp_root = getattr(args, "300wlp_root")
     print(
@@ -216,6 +237,9 @@ def main() -> None:
                 args.global_yolo_output,
                 args.split_seed,
                 args.link_mode,
+                args.max_dsm,
+                args.max_eye12,
+                args.max_pose,
             )
         )
     )
