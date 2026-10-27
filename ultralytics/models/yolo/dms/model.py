@@ -11,6 +11,7 @@ from ultralytics.nn.tasks import DetectionModel
 
 from .loss import DMSROILoss
 from ultralytics.nn.modules.dms_pose import POSE_BIN_CONFIG
+from .schema import ROI_INPUT_CONTRACT, DETECTION_NAMES
 
 
 @dataclass
@@ -44,6 +45,8 @@ class DMSModel(DetectionModel):
         self.roi_head_kwargs = dict(dms_cfg.get("roi_kwargs", {}))
         self.dms_heads = build_roi_head(self.roi_head_name, **self.roi_head_kwargs)
         self.dms_architecture = {
+            "roi_input_contract": ROI_INPUT_CONTRACT,
+            "class_names": list(DETECTION_NAMES),
             "roi_head": self.roi_head_name,
             "roi_kwargs": self.roi_head_kwargs,
             "feature_strides": list(self.feature_strides),

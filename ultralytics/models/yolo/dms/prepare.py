@@ -19,7 +19,7 @@ import yaml
 
 from .data import dsm_image_path, dsm_manifest_entry, iter_dsm, iter_eye12, parse_300wlp_mat
 from .schema import is_face_label, normalized_label
-from dms.shape_bayes import fit_shape_prior
+from .schema import ROI_INPUT_CONTRACT
 
 
 GLOBAL_NAMES = ("face", "phone", "cigarette")
@@ -189,20 +189,13 @@ def build_manifests(
             ),
         ),
     }
-    eye_rows = [
-        {
-            "points": [
-                [
-                    (point[0] - record.crop_box.x1) / max(record.crop_box.width, 1.0),
-                    (point[1] - record.crop_box.y1) / max(record.crop_box.height, 1.0),
-                ]
-                for point in record.points
-            ]
-        }
-        for record in eye_records
-    ]
+    # Do not fit the legacy aligned-crop PCA using held-out samples.  The v2
+    # contract changes orientation and ROI geometry; PCA is explicitly disabled
+    # until a train-only, geometry-compatible prior is supplied and validated.
     (output / "shape_prior.json").write_text(
-        json.dumps(fit_shape_prior(eye_rows), indent=2) + "\n", encoding="utf-8"
+        json.dumps({"enabled": False, "roi_input_contract": ROI_INPUT_CONTRACT,
+                    "reason": "No validated train-only prior for the v2 ROI geometry"}, indent=2) + "\n",
+        encoding="utf-8",
     )
     (output / "summary.json").write_text(json.dumps(counts, indent=2) + "\n", encoding="utf-8")
     if global_yolo_output:

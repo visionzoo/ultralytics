@@ -89,7 +89,8 @@ class DMSROIHeads(nn.Module):
             DWBlock(channels),
             DWBlock(channels),
         )
-        self.parts = nn.Sequential(DWBlock(channels), nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, 15))
+        # Preserve coarse spatial bins for slot box regression, unlike GAP.
+        self.parts = nn.Sequential(DWBlock(channels), nn.AdaptiveAvgPool2d(4), nn.Flatten(), nn.Linear(channels * 16, 15))
         self.eye_state = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, 2 * eye_states))
         self.mouth_state = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, mouth_states))
         # Keep the heatmap as the only deployed landmark representation, but
@@ -137,10 +138,12 @@ class DMSROIHeads(nn.Module):
         p3_rois = nn.functional.interpolate(p3_rois, size=(32, 32), mode="bilinear", align_corners=False)
         face = self.fuse(torch.cat((b2_rois, p3_rois), 1))
         part_values = self.parts(face).reshape(count, 3, 5)
+        corners = part_values[..., :4].sigmoid().reshape(count, 3, 2, 2)
+        part_boxes = torch.cat((corners.amin(-2), corners.amax(-2)), -1)
         pose_feature = self.pose_pool(face)
         result = {
             "face_feature": face,
-            "part_box": part_values[..., :4].sigmoid(),
+            "part_box": part_boxes,
             "part_presence_logits": part_values[..., 4],
             "eye_state_logits": self.eye_state(face).reshape(count, 2, self.eye_states),
             "mouth_state_logits": self.mouth_state(face).reshape(count, 1, self.mouth_states),

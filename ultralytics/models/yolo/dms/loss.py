@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 
 import torch
 from torch import nn
@@ -15,8 +16,7 @@ class DMSROILoss(nn.Module):
     def __init__(
         self, heatmap_sigma: float = 1.5, shape_prior=None,
         pose_scale=(55.0, 12.0, 11.0), pose_center=(0.0, 0.0, 0.0),
-        yaw_bin_weight: float = 1.0, pose_continuous_weight: float = 1.0,
-        pose_yaw_continuous_weight: float = 3.0,
+        pose_axis_weights=(1.0, 1.0, 1.0), pose_continuous_weight: float = 1.0,
         landmark_coord_weight: float = 1.0,
         landmark_peak_weight: float = 0.25,
         landmark_geometry_weight: float = 4.0,
@@ -24,9 +24,10 @@ class DMSROILoss(nn.Module):
         super().__init__()
         self.heatmap_sigma = heatmap_sigma
         self.shape_prior = shape_prior
-        self.yaw_bin_weight = float(yaw_bin_weight)
+        self.pose_axis_weights = tuple(float(value) for value in pose_axis_weights)
+        if len(self.pose_axis_weights) != 3 or not all(math.isfinite(v) for v in self.pose_axis_weights) or min(self.pose_axis_weights) < 0 or sum(self.pose_axis_weights) <= 0:
+            raise ValueError("pose_axis_weights must be three nonnegative weights with positive sum")
         self.pose_continuous_weight = float(pose_continuous_weight)
-        self.pose_yaw_continuous_weight = float(pose_yaw_continuous_weight)
         self.landmark_coord_weight = float(landmark_coord_weight)
         self.landmark_peak_weight = float(landmark_peak_weight)
         self.landmark_geometry_weight = float(landmark_geometry_weight)
@@ -209,7 +210,7 @@ class DMSROILoss(nn.Module):
                 pred_right - pred_left, target_right - target_left, reduction="none"
             ).mean(-1)
             losses["landmark_geometry"] = self.landmark_geometry_weight * self._masked_mean(
-                geometry_error, valid.any(-1)
+                geometry_error, valid[:, (0, 3, 6, 9)].all(-1)
             )
             # Report the same heatmap argmax/sub-pixel decoder used by
             # deployment.  The differentiable expectation above remains an
@@ -225,8 +226,8 @@ class DMSROILoss(nn.Module):
             eye_left = points[:, (0, 3)].mean(1)
             eye_right = points[:, (6, 9)].mean(1)
             interocular = torch.linalg.vector_norm(eye_right - eye_left, dim=-1).clamp_min(1e-6)
-            eye12_nme = metric_error.mean(-1) / interocular
-            losses["landmark_eye12_nme"] = self._masked_mean(eye12_nme, valid.any(-1)).detach()
+            eye12_nme = (metric_error * valid).sum(-1) / valid.sum(-1).clamp_min(1) / interocular
+            losses["landmark_eye12_nme"] = self._masked_mean(eye12_nme, valid[:, (0, 3, 6, 9)].all(-1)).detach()
             losses["landmark_soft_nme"] = self._masked_mean(
                 torch.linalg.vector_norm(decoded - points, dim=-1), valid
             ).detach()
@@ -254,8 +255,6 @@ class DMSROILoss(nn.Module):
                     distance = (centers[None] - target_axis[:, None]).abs() / step
                     soft_target = torch.exp(-0.5 * distance.square()).div( torch.exp(-0.5 * distance.square()).sum(-1, keepdim=True).clamp_min(1e-8))
                     bin_loss = -(soft_target * outputs[f"{axis}_bin_logits"].log_softmax(-1)).sum(-1)
-                    if axis == "yaw":
-                        bin_loss = bin_loss * self.yaw_bin_weight
                     residual_target = (target_axis - centers[bin_index]) / step
                     residual_loss = nn.functional.smooth_l1_loss(
                         outputs[f"{axis}_residual"].squeeze(-1), residual_target, reduction="none"
@@ -263,30 +262,19 @@ class DMSROILoss(nn.Module):
                     losses[f"pose_{axis}_bin"] = self._masked_mean(bin_loss, valid)
                     losses[f"pose_{axis}_residual"] = self._masked_mean(residual_loss, valid)
                     axis_errors.append(losses[f"pose_{axis}_bin"] + losses[f"pose_{axis}_residual"])
-                pose_error = sum(axis_errors) / len(axis_errors)
+                axis_weights = outputs["pose_ypr"].new_tensor(self.pose_axis_weights)
+                pose_error = (torch.stack(axis_errors) * axis_weights).sum() / axis_weights.sum()
                 # Bin/residual decoding is useful for large pose ranges, but
                 # the expected angle can still collapse to the train mean.
                 # Keep a direct normalized continuous term so every axis is
                 # trained against the actual degree target as well.
-                continuous_weights = outputs["pose_ypr"].new_tensor(
-                    (self.pose_yaw_continuous_weight, 1.0, 1.0)
-                )
+                continuous_weights = axis_weights
                 # Replace the unweighted aggregate with the yaw-emphasized
                 # version while preserving valid-sample normalization.
                 losses["pose_continuous"] = self.pose_continuous_weight * self._masked_mean(
                     nn.functional.smooth_l1_loss(pred_norm, target_norm, reduction="none")
                     .mul(continuous_weights)
                     .sum(-1) / continuous_weights.sum(), valid
-                )
-                # Keep an undiluted yaw term.  Averaging three axes can make
-                # the wide yaw range look inexpensive beside pitch/roll and
-                # lets an ROI head settle at the train mean.  This term still
-                # uses normalized degrees; public outputs remain degrees.
-                yaw_error = nn.functional.smooth_l1_loss(
-                    pred_norm[:, 0], target_norm[:, 0], reduction="none"
-                )
-                losses["pose_yaw_continuous"] = (
-                    self.pose_yaw_continuous_weight * self._masked_mean(yaw_error, valid)
                 )
             else:
                 # Compatibility path for old scalar-yaw checkpoints.
@@ -305,6 +293,7 @@ class DMSROILoss(nn.Module):
         total = sum(
             (value for name, value in losses.items()
              if name != "landmark_nme"
+             and name != "landmark_eye12_nme"
              and name != "landmark_soft_nme"
              and not name.startswith("landmark_pck")
              and not name.startswith("pose_mae_")

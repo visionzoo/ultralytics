@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import zlib
+from functools import lru_cache
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -15,28 +17,41 @@ from torch.utils.data import Dataset
 from ultralytics.data.augment import LetterBox
 
 from .schema import is_face_label
+from .geometry import square_rois
+
+
+@lru_cache(maxsize=8)
+def face_scale_reference(manifest: str) -> tuple[float, ...]:
+    """DSM TRAIN face-side fractions after full-frame letterbox; no val/test leakage."""
+    scales = []
+    for line in Path(manifest).read_text(encoding="utf-8").splitlines():
+        row = json.loads(line)
+        if row.get("split") != "train":
+            continue
+        width, height = row["size"]
+        for obj in row.get("objects", []):
+            if is_face_label(obj["label"]):
+                x1, y1, x2, y2 = obj["box_xyxy"]
+                side = max(x2 - x1, y2 - y1) / max(width, height)
+                if 0 < side <= 1:
+                    scales.append(side)
+    if not scales:
+        raise ValueError(f"No train face scale reference in {manifest}")
+    return tuple(scales)
 
 
 def _box(values: list[float] | tuple[float, ...]) -> np.ndarray:
     return np.asarray(values, dtype=np.float32)
 
 
-def _square_box(box: np.ndarray, width: int, height: int) -> np.ndarray:
-    """Square a face ROI with the same center-preserving rule as deployment."""
-    x1, y1, x2, y2 = box.astype(np.float32, copy=True)
-    size = max(float(x2 - x1), float(y2 - y1), 1.0)
-    cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
-    x1, y1 = cx - size * 0.5, cy - size * 0.5
-    x1 = min(max(x1, 0.0), max(float(width) - size, 0.0))
-    y1 = min(max(y1, 0.0), max(float(height) - size, 0.0))
-    return np.asarray([x1, y1, x1 + size, y1 + size], dtype=np.float32)
-
-
 class DMSROIDataset(Dataset):
     """One manifest task per dataset; each sample carries exactly one face ROI."""
 
-    def __init__(self, manifest: str | Path, task: str, image_size: int = 640, split: str | None = None):
+    def __init__(self, manifest: str | Path, task: str, image_size: int = 640, split: str | None = None,
+                 match_scale: bool = True):
         self.task, self.image_size = task, image_size
+        self.split = split
+        self.scales = face_scale_reference(str(Path(manifest).parent / "dsm.jsonl")) if match_scale and task in {"landmark", "pose"} else ()
         rows = [json.loads(line) for line in Path(manifest).read_text(encoding="utf-8").splitlines()]
         if split:
             rows = [row for row in rows if row.get("split") == split]
@@ -93,10 +108,11 @@ class DMSROIDataset(Dataset):
         image = cv2.imread(sample["image"])
         if image is None:
             raise FileNotFoundError(sample["image"])
+        source_image = image
         image_height, image_width = image.shape[:2]
         face = _box(sample["face_box_xyxy"]).reshape(1, 4)
         points = None
-        if self.task == "landmark":
+        if self.task == "landmark" and sample.get("image_scope") != "full_frame":
             # Eye12's ``image`` is already the canonical aligned crop (the
             # generated files are 128x128).  ``crop_box_xyxy`` and
             # ``alignment_matrix`` describe where that crop came from in the
@@ -106,8 +122,6 @@ class DMSROIDataset(Dataset):
             points = np.asarray(sample["points"], dtype=np.float32)
             face = np.asarray([[0, 0, width, height]], dtype=np.float32)
         source_face = face[0].copy()
-        if self.task != "landmark":
-            source_face = _square_box(source_face, image_width, image_height)
         # Encode the available source image once, preserving its context and
         # aspect ratio. Only features, not input pixels, are cropped for the
         # student. Eye12/300W-LP remain crop-only sources when no full frame is
@@ -123,17 +137,52 @@ class DMSROIDataset(Dataset):
         face = source_face * np.tile(ratio, 2) + np.asarray(
             [params["left"], params["top"], params["left"], params["top"]], dtype=np.float32
         )
+        offset = np.asarray([params["left"], params["top"]], dtype=np.float32)
+        matrix = np.asarray([[ratio[0], 0, offset[0]], [0, ratio[1], offset[1]]], dtype=np.float32)
+        if self.scales and sample.get("image_scope") != "full_frame":
+            # Use native image pixels, not a 320px upsampled face.  Match the
+            # DSM face-cell distribution; only train samples randomize placement.
+            rng = np.random if self.split == "train" else np.random.RandomState(zlib.crc32(sample["image"].encode()))
+            fraction = self.scales[int(rng.randint(len(self.scales)))]
+            side = max(1.0, fraction * self.image_size)
+            source_side = max(float(source_face[2] - source_face[0]), float(source_face[3] - source_face[1]), 1.0)
+            rotation = np.eye(2, dtype=np.float32)
+            if self.task == "landmark" and sample.get("alignment_matrix") is not None:
+                # Undo the known in-plane alignment only.  This does not
+                # fabricate missing full-frame context or source-image identity.
+                alignment = np.asarray(sample["alignment_matrix"], dtype=np.float32)[:, :2]
+                angle = np.arctan2(alignment[1, 0], alignment[0, 0])
+                c, s = np.cos(angle), np.sin(angle)
+                rotation = np.asarray([[c, s], [-s, c]], dtype=np.float32)
+                source_side *= abs(float(c)) + abs(float(s))
+            scale = side / source_side
+            center = (source_face[:2] + source_face[2:]) / 2
+            dest = rng.uniform(side / 2, self.image_size - side / 2, size=2) if self.split == "train" else np.asarray([self.image_size / 2] * 2)
+            linear = scale * rotation
+            matrix = np.column_stack((linear, dest - linear @ center)).astype(np.float32)
+            image = cv2.warpAffine(source_image, matrix, (self.image_size, self.image_size), flags=cv2.INTER_LINEAR, borderValue=(114, 114, 114))
+            corners = np.asarray([[source_face[0], source_face[1]], [source_face[2], source_face[1]],
+                                  [source_face[2], source_face[3]], [source_face[0], source_face[3]]], dtype=np.float32)
+            corners = corners @ matrix[:, :2].T + matrix[:, 2]
+            face = np.concatenate((corners.min(0), corners.max(0)))
+        # Apply precisely the same square-after-letterbox rule as deployment.
+        roi = torch.tensor([[0, *face.tolist()]], dtype=torch.float32)
+        face = square_rois(roi, self.image_size, self.image_size)[0, 1:].numpy()
         img = torch.from_numpy(np.ascontiguousarray(image[..., ::-1].transpose(2, 0, 1)))
         result: dict[str, Any] = {
             "task": self.task,
             "img": img,
             "face_box": torch.from_numpy(face),
+            "source_to_input": torch.from_numpy(matrix),
         }
         if self.task == "landmark":
             points = torch.tensor(sample["points"] if points is None else points, dtype=torch.float32)
-            original_face = _box(source_face)
-            result["landmark_xy"] = (points - original_face[:2]) / (original_face[2:] - original_face[:2]).clip(min=1)
-            result["landmark_valid"] = torch.ones(12, dtype=torch.bool)
+            points = points.numpy() @ matrix[:, :2].T + matrix[:, 2]
+            normalized = (points - face[:2]) / (face[2:] - face[:2]).clip(min=1)
+            result["landmark_xy"] = torch.from_numpy(normalized)
+            annotated = torch.as_tensor(sample.get("landmark_valid", [True] * 12), dtype=torch.bool)
+            result["landmark_valid"] = annotated & torch.isfinite(result["landmark_xy"]).all(-1) & ((result["landmark_xy"] >= 0) & (result["landmark_xy"] <= 1)).all(-1)
+            result["landmark_xy"] = torch.nan_to_num(result["landmark_xy"], nan=0., posinf=0., neginf=0.)
         elif self.task == "pose":
             result["pose_ypr"] = torch.tensor(sample["pose_ypr_deg"], dtype=torch.float32)
             result["pose_valid"] = torch.tensor(True)
@@ -150,7 +199,8 @@ class DMSROIDataset(Dataset):
                 raw_box = _box([target["box"][axis] for axis in ("x1", "y1", "x2", "y2")])
                 center_x = (raw_box[0] + raw_box[2]) / 2
                 slot = 2 if part == "mouth" else (0 if center_x < (original_face[0] + original_face[2]) / 2 else 1)
-                part_box[slot] = torch.from_numpy((raw_box - np.tile(original_face[:2], 2)) / np.tile((original_face[2:] - original_face[:2]).clip(min=1), 2))
+                transformed = raw_box.reshape(2, 2) @ matrix[:, :2].T + matrix[:, 2]
+                part_box[slot] = torch.from_numpy(((transformed - face[:2]) / (face[2:] - face[:2]).clip(min=1)).reshape(4))
                 part_box_valid[slot] = part_present_valid[slot] = True
                 part_present[slot] = 1
                 state = target.get("state")
@@ -170,6 +220,9 @@ class DMSROIDataset(Dataset):
                 mouth_state=mouth_state,
                 mouth_state_valid=mouth_state_valid,
             )
+        if "part_box" in result:
+            from .geometry import mask_cropped_parts
+            result = mask_cropped_parts(result)
         return result
 
 

@@ -11,6 +11,8 @@ from torch import nn
 
 from .model import DMSModel
 from .schema import LANDMARK_NAMES, PART_SLOTS, ROI_INPUT_CONTRACT
+from .schema import DETECTION_NAMES
+from .postprocess import HOST_NMS_IOU
 
 
 class EncoderExport(nn.Module):
@@ -99,11 +101,18 @@ def export_dms_onnx(
     )
     manifest = {
         "schema_version": 1,
+        "class_names": list(DETECTION_NAMES),
+        "host_postprocess": {"nms": "class_aware", "iou_threshold": HOST_NMS_IOU,
+                             "max_det": 100, "reference": "ultralytics.models.yolo.dms.postprocess"},
+        "landmark_decode": {"decoder": "argmax_quarter_pixel", "geometry_correction": False,
+                            "map_box": "square_roi", "normalization": "heatmap_width_minus_one_height_minus_one"},
         "roi_input_contract": ROI_INPUT_CONTRACT,
         "image_size": image_size,
         "max_faces": max_faces,
         "dms_architecture": model.dms_architecture,
         "roi_align": {
+            "sampling_ratio": -1,
+            "host_reference": "dms.host_roi_align.roi_align_numpy",
             "aligned": True,
             "b2_stride": model.feature_strides[0],
             "p3_stride": model.feature_strides[1],
